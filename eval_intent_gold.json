@@ -1,0 +1,256 @@
+{
+  "__meta__": {
+    "schema_ver": "intent_gold_v1",
+    "description": "意图链路人工标注金标集（静态资产，不调 LLM 生成、不绑索引位置，随代码进版本库）。判定口径见 4-evaluate.py:evaluate_intent_gold。",
+    "label_rules": {
+      "gold_action": "retrieve=应进入检索（含改写后检索）；clarify=应追问短路",
+      "gold_types": "预期 query_types，主类型放第一个；明确型(clear)在线上会被归一为空类型，故 clear 样例此处留空数组",
+      "gold_multi": "是否预期多意图拆分（queries>=2）",
+      "must_include": "retrieve 样例改写后子问题中必须全部保留的事实词（子串匹配），用于度量指代消解/补全质量",
+      "history": "对话历史，role ∈ user/assistant；缺省为无历史"
+    },
+    "type_enums": ["clear", "underspecified", "context_dependent", "pronoun", "comparison", "multi_intent", "rhetorical"]
+  },
+  "items": [
+    {
+      "query": "多少钱",
+      "history": [],
+      "gold_action": "clarify",
+      "gold_types": ["underspecified"],
+      "gold_multi": false,
+      "must_include": [],
+      "note": "无主体参数化事实查询，无历史线索，应追问"
+    },
+    {
+      "query": "几点开始",
+      "history": [],
+      "gold_action": "clarify",
+      "gold_types": ["underspecified"],
+      "gold_multi": false,
+      "must_include": [],
+      "note": "缺时间主体（哪个乐园/演出/项目）"
+    },
+    {
+      "query": "在哪买",
+      "history": [],
+      "gold_action": "clarify",
+      "gold_types": ["underspecified"],
+      "gold_multi": false,
+      "must_include": [],
+      "note": "购买对象缺失"
+    },
+    {
+      "query": "怎么预约",
+      "history": [],
+      "gold_action": "clarify",
+      "gold_types": ["underspecified"],
+      "gold_multi": false,
+      "must_include": [],
+      "note": "预约对象缺失（项目/餐厅/酒店均可能）"
+    },
+    {
+      "query": "那儿童票呢",
+      "history": [
+        {"role": "user", "content": "上海迪士尼乐园的一日票多少钱？"},
+        {"role": "assistant", "content": "上海迪士尼乐园一日票标准票价为499元。"}
+      ],
+      "gold_action": "retrieve",
+      "gold_types": ["context_dependent"],
+      "gold_multi": false,
+      "must_include": ["儿童", "票"],
+      "note": "追问须继承上文『上海迪士尼一日票』限定"
+    },
+    {
+      "query": "我家孩子1米1能玩吗",
+      "history": [
+        {"role": "user", "content": "创极速光轮有什么身高要求？"},
+        {"role": "assistant", "content": "创极速光轮要求游客身高达到122厘米。"}
+      ],
+      "gold_action": "retrieve",
+      "gold_types": ["context_dependent"],
+      "gold_multi": false,
+      "must_include": ["创极速光轮"],
+      "note": "上文实体（创极速光轮）必须补全进改写"
+    },
+    {
+      "query": "在哪里可以买到",
+      "history": [
+        {"role": "user", "content": "迪士尼尊享卡是什么？"},
+        {"role": "assistant", "content": "迪士尼尊享卡是园内热门项目的付费优先通行服务。"}
+      ],
+      "gold_action": "retrieve",
+      "gold_types": ["context_dependent"],
+      "gold_multi": false,
+      "must_include": ["尊享卡"],
+      "note": "购买对象承自上文"
+    },
+    {
+      "query": "人均消费多少",
+      "history": [
+        {"role": "user", "content": "巴波萨烧烤餐厅在哪个位置？"},
+        {"role": "assistant", "content": "巴波萨烧烤位于宝藏湾主题区域。"}
+      ],
+      "gold_action": "retrieve",
+      "gold_types": ["context_dependent"],
+      "gold_multi": false,
+      "must_include": ["巴波萨"],
+      "note": "餐厅主体承自上文"
+    },
+    {
+      "query": "它的身高限制是多少",
+      "history": [
+        {"role": "user", "content": "七个小矮人矿山车在哪里？"},
+        {"role": "assistant", "content": "七个小矮人矿山车位于梦幻世界。"}
+      ],
+      "gold_action": "retrieve",
+      "gold_types": ["pronoun"],
+      "gold_multi": false,
+      "must_include": ["矿山车"],
+      "note": "『它』→矿山车"
+    },
+    {
+      "query": "这个项目要排多久",
+      "history": [
+        {"role": "user", "content": "晶彩奇航好玩吗？"},
+        {"role": "assistant", "content": "晶彩奇航是适合全家共乘的游船项目。"}
+      ],
+      "gold_action": "retrieve",
+      "gold_types": ["pronoun"],
+      "gold_multi": false,
+      "must_include": ["晶彩奇航"],
+      "note": "『这个项目』→晶彩奇航"
+    },
+    {
+      "query": "那个项目会弄湿衣服吗",
+      "history": [
+        {"role": "user", "content": "探险家独木舟在哪里乘坐？"},
+        {"role": "assistant", "content": "探险家独木舟在宝藏湾的船奇戏水滩附近。"}
+      ],
+      "gold_action": "retrieve",
+      "gold_types": ["pronoun"],
+      "gold_multi": false,
+      "must_include": ["独木舟"],
+      "note": "『那个项目』→探险家独木舟"
+    },
+    {
+      "query": "快速通行证和迪士尼尊享卡有什么区别？",
+      "history": [],
+      "gold_action": "retrieve",
+      "gold_types": ["comparison"],
+      "gold_multi": false,
+      "must_include": [],
+      "note": "对比对象完整，应展开价格/人群/用法维度检索"
+    },
+    {
+      "query": "上海迪士尼乐园酒店和玩具总动员酒店哪个更适合亲子？",
+      "history": [],
+      "gold_action": "retrieve",
+      "gold_types": ["comparison"],
+      "gold_multi": false,
+      "must_include": [],
+      "note": "两家酒店对比"
+    },
+    {
+      "query": "那它和尊享卡哪个更划算",
+      "history": [
+        {"role": "user", "content": "飞跃地平线的快速通行证多少钱？"},
+        {"role": "assistant", "content": "该项目快速通行证价格依日期浮动。"}
+      ],
+      "gold_action": "retrieve",
+      "gold_types": ["comparison"],
+      "gold_multi": false,
+      "must_include": ["快速通行证", "尊享卡"],
+      "note": "对比+指代：『它』须从历史补全为快速通行证"
+    },
+    {
+      "query": "门票多少钱？停车场怎么收费？",
+      "history": [],
+      "gold_action": "retrieve",
+      "gold_types": ["multi_intent"],
+      "gold_multi": true,
+      "must_include": [],
+      "note": "两个并列独立事实问题"
+    },
+    {
+      "query": "创极速光轮身高限制是多少？雷鸣山漂流会弄湿衣服吗？",
+      "history": [],
+      "gold_action": "retrieve",
+      "gold_types": ["multi_intent"],
+      "gold_multi": true,
+      "must_include": [],
+      "note": "两个项目的独立问题"
+    },
+    {
+      "query": "乐园早上几点开门？里面有什么餐厅？停车一天多少钱？",
+      "history": [],
+      "gold_action": "retrieve",
+      "gold_types": ["multi_intent"],
+      "gold_multi": true,
+      "must_include": [],
+      "note": "三个独立问题（营业时间/餐饮/停车）"
+    },
+    {
+      "query": "排了两个小时队就玩一个项目，也太坑了吧！",
+      "history": [],
+      "gold_action": "retrieve",
+      "gold_types": ["rhetorical"],
+      "gold_multi": false,
+      "must_include": ["排队"],
+      "note": "情绪背后诉求是排队时间/免排队方式"
+    },
+    {
+      "query": "凭什么自己带的食物不让带进园？",
+      "history": [],
+      "gold_action": "retrieve",
+      "gold_types": ["rhetorical"],
+      "gold_multi": false,
+      "must_include": ["食"],
+      "note": "质疑背后是食品携带规则"
+    },
+    {
+      "query": "这雨下得还怎么玩啊！",
+      "history": [],
+      "gold_action": "retrieve",
+      "gold_types": ["rhetorical"],
+      "gold_multi": false,
+      "must_include": ["雨"],
+      "note": "情绪背后是雨天游玩安排"
+    },
+    {
+      "query": "上海迪士尼乐园成人一日票价格是多少？",
+      "history": [],
+      "gold_action": "retrieve",
+      "gold_types": [],
+      "gold_multi": false,
+      "must_include": [],
+      "note": "明确型：主体/意图完整，线上归一后 types 为空并按原句检索"
+    },
+    {
+      "query": "创极速光轮的身高限制是多少厘米？",
+      "history": [],
+      "gold_action": "retrieve",
+      "gold_types": [],
+      "gold_multi": false,
+      "must_include": [],
+      "note": "明确型"
+    },
+    {
+      "query": "上海迪士尼停车场一天收费多少钱？",
+      "history": [],
+      "gold_action": "retrieve",
+      "gold_types": [],
+      "gold_multi": false,
+      "must_include": [],
+      "note": "明确型"
+    },
+    {
+      "query": "七个小矮人矿山车位于哪个主题园区？",
+      "history": [],
+      "gold_action": "retrieve",
+      "gold_types": [],
+      "gold_multi": false,
+      "must_include": [],
+      "note": "明确型"
+    }
+  ]
+}

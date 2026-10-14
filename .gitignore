@@ -1,0 +1,14 @@
+# 密钥
+.env
+
+# 构建产物
+output/
+converted/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# 临时
+*.log
