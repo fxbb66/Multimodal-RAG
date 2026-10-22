@@ -7,8 +7,9 @@
 # 已存在的转换结果会跳过（可删除 converted/ 强制重转）。
 
 $ErrorActionPreference = 'Stop'
-$kbRoot = "d:\FDE学习资料\9-RAG多模态数据处理\CASE-迪士尼RAG助手\迪士尼RAG知识库（完整）"
-$outDir = "d:\FDE学习资料\9-RAG多模态数据处理\CASE-迪士尼RAG助手\7-完整知识库版本\converted"
+# 路径全部相对本脚本解析（$PSScriptRoot = 8-金标扩充版本/），换机/换用户不再失效
+$kbRoot = Join-Path (Split-Path -Parent $PSScriptRoot) "迪士尼RAG知识库（完整）"
+$outDir = Join-Path $PSScriptRoot "converted"
 New-Item -ItemType Directory -Force -Path $outDir | Out-Null
 
 $manifest = @()

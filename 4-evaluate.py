@@ -44,18 +44,20 @@ from retriever import (HybridRetriever, expand_query_terms,  # noqa: E402
                        ascii_faiss_path, RERANK_STATS, intent_rewrite,
                        build_context)
 from settings import (DASHSCOPE_API_KEY, EMBEDDING_API_KEY, GEN_API_KEY,  # noqa: E402
-                      REWRITE_API_KEY,
-                      AGICTO_BASE_URL, EMBEDDING_MODEL, EMBEDDING_DIM,
-                      REWRITE_MODEL, GEN_MODEL, RERANK_TOPN,
-                      MAX_PER_SOURCE, USE_MMR, MMR_LAMBDA, EVAL_WORKERS,
-                      INTENT_ENABLED, INTENT_CONFIDENCE_MIN, INTENT_MAX_SUB_QUERIES,
-                      ONLINE_SYSTEM_PROMPT)
+                     REWRITE_API_KEY,
+                     AGICTO_BASE_URL, EMBEDDING_MODEL, EMBEDDING_DIM,
+                     REWRITE_MODEL, GEN_MODEL, RERANK_TOPN,
+                     MAX_PER_SOURCE, USE_MMR, MMR_LAMBDA, EVAL_WORKERS,
+                     BM25_WEIGHT, EVIDENCE_SELF_CHECK, EVIDENCE_MAX_RETRY,
+                     INTENT_ENABLED, INTENT_CONFIDENCE_MIN, INTENT_MAX_SUB_QUERIES,
+                     ONLINE_SYSTEM_PROMPT)
 
 OUT_DIR = os.path.join(_HERE, "output")
 INDEX_FILE = os.path.join(OUT_DIR, "disney_full_index.faiss")
 METADATA_FILE = os.path.join(OUT_DIR, "disney_full_metadata.json")
 BM25_FILE = os.path.join(OUT_DIR, "bm25_index.pkl")
 QA_FILE = os.path.join(OUT_DIR, "eval_qa_v2.json")
+COLL_FILE = os.path.join(OUT_DIR, "eval_qa_colloquial.json")  # S6+ 口语化补充集（16-gen_colloquial.py 生成）
 RESULT_FILE = os.path.join(OUT_DIR, "eval_results.json")
 INTENT_GOLD_FILE = os.path.join(_HERE, "eval_intent_gold.json")  # 人工静态尺子（进版本库，非生成物）
 
@@ -66,7 +68,7 @@ if DASHSCOPE_API_KEY:
     except ImportError:
         pass
 
-ANSWER_EVAL_N = 80  # N2: 答案侧有效样本量（原 40 过小）
+ANSWER_EVAL_N = 183  # N2: 答案侧有效样本量（原 40 过小）；2026-10-20 随 QA 金标 82→183 全量放开
 MAX_QA_PER_SOURCE = 2  # N2: 每来源文件最多抽取的 gold chunk 数，缓解同源偏差
 # QA 尺子结构：chunk_hash 指纹 remap（2026-10-02 起 gold_idx 不再绑索引位置）；改 remap 规则必须 bump
 QA_SCHEMA_VER = "chunk_hash_v1"
@@ -146,7 +148,7 @@ def get_embedding(text):
 # 改写结果（含置信不足/异常的降级结果）按 (模型,阈值,query,history) 落盘，
 # "改写 query 检索档"/意图评测/意图金标三处共用，跨档跨运行零重复 LLM 调用、可复现。
 REWRITE_CACHE_FILE = os.path.join(OUT_DIR, "eval_rewrite_cache.json")
-REWRITE_CACHE_VER = "v2"  # v2(2026-10-02)：retriever 新增短问/三连问确定性规则门；改 intent prompt/规则时 bump
+REWRITE_CACHE_VER = "v4"  # v4(2026-10-21)：S4 门放宽（underspecified+无历史+指代即触发，不再看 need_clarification）；改 intent 规则时 bump
 _rw_cache = {}
 _rw_lock = threading.Lock()
 RW_CACHE_HIT = {"hit": 0, "miss": 0}
@@ -453,6 +455,29 @@ def build_qa_set(n_chunks=80, index_md5=None):
     return qa
 
 
+def _append_colloquial(items, h2i, idx_md5):
+    """S6+ 口语化补充集并入主 QA（仅 QA_INCLUDE_COLLOQUIAL=1 时生效，默认关）。
+    补充集由 16-gen_colloquial.py 生成，复用父题 chunk_hash/gold_idx，
+    按同一指纹 remap 到当前索引，确保混入不改变既有 183 书面口径。"""
+    if os.environ.get("QA_INCLUDE_COLLOQUIAL", "").lower() not in ("1", "true", "yes"):
+        return items
+    if not os.path.exists(COLL_FILE):
+        log.warning("QA_INCLUDE_COLLOQUIAL=1 但补充集缺失: %s", COLL_FILE)
+        return items
+    try:
+        raw = json.load(open(COLL_FILE, encoding="utf-8"))
+        supp = raw.get("items", []) if isinstance(raw, dict) else raw
+    except Exception as e:
+        log.warning("口语化补充集损坏: %s", e)
+        return items
+    kept, missing = _remap_qa(supp, h2i)
+    print(f"[口语化混入] 并入 {len(kept)}/{len(supp)} 条（剔除失配 {len(missing)}），"
+          f"QA 尺子总量 {len(items)} → {len(items) + len(kept)}")
+    log.info("colloquial merged kept=%d missing=%d total=%d", len(kept), len(missing),
+             len(items) + len(kept))
+    return items + kept
+
+
 def load_or_build_qa(idx_md5):
     """加载 QA 尺子并按 chunk_hash 与当前索引对齐（尺子与索引位置解耦）。
     - 有指纹 QA：gold_idx 按内容指纹 remap 到当前位置；失配率 <= 阈值时剔除失配条目后复用，
@@ -503,7 +528,7 @@ def load_or_build_qa(idx_md5):
             print(msg)
             log.info("QA remap %s -> %s: kept=%d missing=%d",
                      born, idx_md5, len(kept), len(missing))
-            return kept
+            return _append_colloquial(kept, h2i, idx_md5)
     elif items is not None:
         print(f"[QA 尺子无 chunk_hash 指纹（{len(items)} 条旧结构），无法跨索引对齐，重新生成]")
         log.warning("QA 无指纹旧结构 %d 条，重生成", len(items))
@@ -512,7 +537,7 @@ def load_or_build_qa(idx_md5):
     t_qa = time.time()
     qa = build_qa_set(n_chunks=80, index_md5=idx_md5)
     log.info("QA 集生成完成: %d 对, %.0fs", len(qa), time.time() - t_qa)
-    return qa
+    return _append_colloquial(qa, h2i, idx_md5)
 
 
 def _run_concurrent(work_items, workers, label, on_done=None, checkpoint=None):
@@ -783,7 +808,18 @@ def evaluate_answers(retriever, qa, vec_cache, label, use_rerank, n=ANSWER_EVAL_
                               retriever.meta[i]["content"]) for i, _ in ranked)
         ev, ok, ans = answer_hit(q, item["gold_answer"], ctx,
                                  prompt_style=prompt_style)
-        return ev, ok, ans, item
+        # 逐题明细仅 online 档落 results[]：ragas 三指标交叉验证（14-ragas_eval.py）
+        # 与人工抽检的输入；其余档位落明细只会让 eval_results.json 膨胀数倍。
+        detail = None
+        if prompt_style == "online":
+            detail = {
+                "query": q, "gold_answer": item["gold_answer"],
+                "answer": ans, "evidence": bool(ev), "hit": bool(ok),
+                "chunk_ids": [int(i) for i, _ in ranked],
+                "contexts": [retriever.meta[i]["content"][:2000]
+                             for i, _ in ranked],
+            }
+        return ev, ok, ans, item, detail
 
     def _progress(done, total, secs):
         print(f"    [{label}] {done}/{total}  ({secs:.0f}s)")
@@ -794,11 +830,14 @@ def evaluate_answers(retriever, qa, vec_cache, label, use_rerank, n=ANSWER_EVAL_
 
     n_ev = n_gen = n_ev_gen = n_fail = 0
     shown = 0
-    for ev, ok, ans, item in outs:  # 按 subset 原顺序聚合，失败样例稳定可复现
+    details = []
+    for ev, ok, ans, item, detail in outs:  # 按 subset 原顺序聚合，失败样例稳定可复现
         q = item["query"]
         n_ev += ev
         n_gen += ok
         n_ev_gen += (1 if ev and ok else 0)
+        if detail is not None:
+            details.append(detail)
         if ev and not ok:
             n_fail += 1
             if shown < 5:
@@ -814,6 +853,8 @@ def evaluate_answers(retriever, qa, vec_cache, label, use_rerank, n=ANSWER_EVAL_
         "n": n, "k": k, "use_rerank": use_rerank,
         "max_per_source": max_per_source, "use_mmr": use_mmr,
         "mmr_lambda": mmr_lambda, "prompt_style": prompt_style,
+        # 逐题明细（仅 online 档；其余档为 None）——ragas 交叉验证/人工抽检输入
+        "details": details if details else None,
     }
     cond = res["answer_hit_given_evidence"]
     cond_str = f"{cond:.3f}" if cond is not None else "N/A"
@@ -902,23 +943,35 @@ def evaluate_intent_gold(workers=EVAL_WORKERS):
         gold_types = g.get("gold_types", [])
         pred_types = r.get("query_types", [])
         type_hit = (not gold_types) or (gold_types[0] in pred_types)
-        # 消解词保留：仅对实际进入检索的题判定；全部 must_include 词出现才算通过
+        # 消解词保留：仅对实际进入检索的题判定；全部 must_include 词出现才算通过。
+        # 大小写不敏感（2026-10-21：金标"WiFi"vs 改写输出"wifi"同形，不计未保留）。
         joined = " ".join(r.get("queries", []))
         terms = g.get("must_include", [])
         term_hit = None
         if r["action"] == "retrieve" and terms:
-            term_hit = all(t in joined for t in terms)
+            term_hit = all(t.casefold() in joined.casefold() for t in terms)
         return {
             "query": g["query"], "history_n": len(g.get("history", [])),
             "gold_action": g["gold_action"], "pred_action": r["action"],
             "action_ok": g["gold_action"] == r["action"],
             "gold_types": gold_types, "pred_types": pred_types,
             "type_hit": type_hit,
+            # 降级归因（2026-10-20）：pred_types 为空有两种完全不同的成因——
+            #   1) 真降级：LLM 超时/低置信/解析失败（degraded=True，带 degrade_reason）；
+            #   2) LLM 判定为明确型(clear)，本就无需改写（degraded=False，非故障）。
+            # 不区分这两者就会把"LLM 认为无需改写"误报成"静默降级"。
+            "degraded": bool(r.get("degraded", False)),
+            "degrade_reason": r.get("degrade_reason", ""),
+            "intent_ms": r.get("elapsed_ms"),
             "gold_multi": bool(g.get("gold_multi", False)),
             "pred_multi": bool(r.get("multi_intent")),
             "multi_ok": bool(g.get("gold_multi", False)) == bool(r.get("multi_intent")),
             "term_hit": term_hit, "must_include": terms,
             "queries": r.get("queries", []),
+            # 规则门归因（2026-10-21）：判 clarify 的题来自哪道门——
+            # short_no_entity / multi_question_ge3 / pronoun_no_history(S4)；
+            # None=LLM 路径。S4 门是否生效必须可在产物中直接验证。
+            "rule_gate": r.get("rule_gate"),
             "clarify": r.get("clarify", ""), "note": g.get("note", "")}
 
     outs = _run_concurrent([lambda g=g: _one(g) for g in items], workers, "意图金标")
@@ -1120,6 +1173,32 @@ def main():
     results.append({"label": "答案(混合无rerank,k=5)", **ans_hyb})
     _save_ans_cache()
     log.info("答案缓存 hit=%s miss=%s", ANS_CACHE_HIT["hit"], ANS_CACHE_HIT["miss"])
+
+    # 图片金标检索档（S6，2026-10-20）：12-build_image_gold.py 用 VL 生成的图片 QA，
+    # 走与主评估逐项同源的线上口径检索（k=5+rerank+MMR+限额）。
+    # 缺失/失败不影响主评估（try 包裹），结果进 results[] 与 eval_results 同文件留档。
+    print("\n=== 图片金标检索评估（线上口径，S6） ===")
+    try:
+        import importlib.util as _ilu
+        _spec_img = _ilu.spec_from_file_location(
+            "eval_image_gold_mod", os.path.join(_HERE, "13-eval_image_gold.py"))
+        _img_mod = _ilu.module_from_spec(_spec_img)
+        _spec_img.loader.exec_module(_img_mod)
+        t_img = time.time()
+        _img_mod.ev._load_emb_cache()  # 复用磁盘 embedding 缓存，避免重复调 API
+        img_row = _img_mod.evaluate_image_gold(workers=4)
+        if img_row is not None:
+            results.append(img_row)
+            print(f"  n={img_row['n']}  image_recall@5={img_row['image_recall_at_k']}  "
+                  f"({time.time() - t_img:.0f}s)")
+            print(f"  丢失分布: {img_row['lost_breakdown']}")
+            log.info("图片金标评估完成 n=%s recall=%s %.0fs",
+                     img_row["n"], img_row["image_recall_at_k"],
+                     time.time() - t_img)
+        else:
+            print("  图片金标缺失（未跑 12-build_image_gold.py），跳过")
+    except Exception as e:
+        log.warning("图片金标评估失败（不影响主评估）: %s", str(e)[:150])
 
     # 配置快照（可复现性 + 同源/同管线举证）
     config_snapshot = {

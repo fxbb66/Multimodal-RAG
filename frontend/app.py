@@ -7,7 +7,7 @@
 生成侧：G1 行内引用[n]+文件定位 / G2 qwen-plus / G3 LRU+TTL 会话 / G4 SSE
 工程：密钥与超参全部来自 lib/settings.py（.env），embedding LRU 缓存、
       简单限流、检索耗时日志、/api/health 可观测
-启动：.venv/Scripts/python.exe 7-完整知识库版本/frontend/app.py
+启动：.venv/Scripts/python.exe 8-金标扩充版本/frontend/app.py
 """
 import os
 import sys
@@ -25,16 +25,18 @@ from openai import OpenAI
 from flask import Flask, request, jsonify, render_template, send_from_directory, Response, stream_with_context
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-ROOT7 = os.path.abspath(os.path.join(BASE_DIR, ".."))
-KB_ROOT = os.path.normpath(os.path.join(ROOT7, "..", "迪士尼RAG知识库（完整）"))
-OUT_DIR = os.path.join(ROOT7, "output")
+VERSION_ROOT = os.path.abspath(os.path.join(BASE_DIR, ".."))
+KB_ROOT = os.path.normpath(os.path.join(VERSION_ROOT, "..", "迪士尼RAG知识库（完整）"))
+OUT_DIR = os.path.join(VERSION_ROOT, "output")
 
 # 引入 lib（settings 自动加载 .env，密钥零硬编码）
-sys.path.insert(0, os.path.join(ROOT7, "lib"))
+sys.path.insert(0, os.path.join(VERSION_ROOT, "lib"))
 from retriever import (HybridRetriever, BM25Index, expand_query_terms,  # noqa: E402
                        intent_rewrite, ascii_faiss_path, RERANK_STATS,
-                       build_context, _rule_gate_short_no_entity)
+                       build_context, _rule_gate_short_no_entity,
+                       INTENT_STATS)
 from settings import (DASHSCOPE_API_KEY, EMBEDDING_API_KEY, GEN_API_KEY,  # noqa: E402
+                      RERANK_API_KEY, require_keys,
                       AGICTO_BASE_URL, DASHSCOPE_BASE_URL,
                       EMBEDDING_MODEL, GEN_MODEL, DASHSCOPE_GEN_MODEL,
                       REWRITE_MODEL, RERANK_TOPN, MAX_PER_SOURCE, USE_MMR,
@@ -43,6 +45,7 @@ from settings import (DASHSCOPE_API_KEY, EMBEDDING_API_KEY, GEN_API_KEY,  # noqa
                       SESSION_MAX, SESSION_TTL, EMBED_CACHE_SIZE, RATE_LIMIT_PER_MIN,
                       RERANK_MODELS, INTENT_ENABLED, INTENT_CONFIDENCE_MIN,
                       INTENT_MAX_CLARIFY, INTENT_MAX_SUB_QUERIES,
+                      EVIDENCE_SELF_CHECK, EVIDENCE_MAX_RETRY,
                       ONLINE_SYSTEM_PROMPT as SYSTEM_PROMPT)
 
 # FAISS Windows 中文路径规避：复制到 ASCII 临时路径再读（不 os.chdir 污染全局 cwd）
@@ -99,61 +102,97 @@ _emb_metrics = {"hits": 0, "misses": 0}
 # P1 简单限流：ip -> 最近 60s 请求时间戳队列
 _rate_buckets = {}
 _rate_lock = threading.Lock()
+# G3 会话存储锁：threaded=True 下并发读写 sessions 必须串行化，否则 move_to_end/popitem/
+# 读写交错会致 LRU 失效、KeyError 或会话串号（embedding/限流已有锁，此处补齐会话锁）
+_sess_lock = threading.Lock()
 
 
 def sess_get(sid):
-    if not sid or sid not in sessions:
-        return []
-    s = sessions[sid]
-    if time.time() - s["ts"] > SESSION_TTL:
-        sessions.pop(sid, None)
-        return []
-    s["ts"] = time.time()
-    sessions.move_to_end(sid)
-    return s["msgs"]
+    with _sess_lock:
+        if not sid or sid not in sessions:
+            return []
+        s = sessions[sid]
+        if time.time() - s["ts"] > SESSION_TTL:
+            sessions.pop(sid, None)
+            return []
+        s["ts"] = time.time()
+        sessions.move_to_end(sid)
+        return s["msgs"]
 
 
 def sess_append(sid, msgs):
-    s = sessions.get(sid) or {"msgs": [], "ts": time.time(), "clarify_n": 0}
-    s["msgs"] = (s["msgs"] + msgs)[-20:]  # 单会话最多保留 10 轮
-    s.setdefault("clarify_n", 0)
-    s["ts"] = time.time()
-    sessions[sid] = s
-    sessions.move_to_end(sid)
-    while len(sessions) > SESSION_MAX:
-        sessions.popitem(last=False)
+    with _sess_lock:
+        s = sessions.get(sid) or {"msgs": [], "ts": time.time(), "clarify_n": 0}
+        s["msgs"] = (s["msgs"] + msgs)[-20:]  # 单会话最多保留 10 轮
+        s.setdefault("clarify_n", 0)
+        s["ts"] = time.time()
+        sessions[sid] = s
+        sessions.move_to_end(sid)
+        while len(sessions) > SESSION_MAX:
+            sessions.popitem(last=False)
 
 
 def sess_clarify_get(sid):
     """连续追问计数：防追问死循环；用户正常提问后归零。"""
-    if not sid or sid not in sessions:
-        return 0
-    return sessions[sid].get("clarify_n", 0)
+    with _sess_lock:
+        if not sid or sid not in sessions:
+            return 0
+        return sessions[sid].get("clarify_n", 0)
 
 
 def sess_clarify_incr(sid):
     if not sid:
         return
-    s = sessions.get(sid) or {"msgs": [], "ts": time.time(), "clarify_n": 0}
-    s["clarify_n"] = s.get("clarify_n", 0) + 1
-    sessions[sid] = s
+    with _sess_lock:
+        s = sessions.get(sid) or {"msgs": [], "ts": time.time(), "clarify_n": 0}
+        s["clarify_n"] = s.get("clarify_n", 0) + 1
+        sessions[sid] = s
 
 
 def sess_clarify_reset(sid):
-    if sid and sid in sessions:
-        sessions[sid]["clarify_n"] = 0
+    with _sess_lock:
+        if sid and sid in sessions:
+            sessions[sid]["clarify_n"] = 0
 
 
 def sess_prune():
-    now = time.time()
-    for k in [k for k, v in sessions.items() if now - v["ts"] > SESSION_TTL]:
-        sessions.pop(k, None)
+    with _sess_lock:
+        now = time.time()
+        for k in [k for k, v in sessions.items() if now - v["ts"] > SESSION_TTL]:
+            sessions.pop(k, None)
+
+
+def _maintenance_loop(interval=300):
+    """周期清扫 daemon：过期会话 + 限流空桶。
+
+    sess_prune 原先只在 /api/session/new 时触发，限流桶更只在同一 IP 再次
+    请求时才清理过期项——不常来的 IP/会话会一直驻留内存。SESSION_MAX LRU
+    与单 IP deque 长度各自有界，但周期清扫让 TTL 语义真正成立，长跑内存
+    上界不依赖访客行为。清扫异常不影响主服务。"""
+    while True:
+        time.sleep(interval)
+        try:
+            sess_prune()
+            now = time.time()
+            with _rate_lock:
+                dead = [k for k, q in _rate_buckets.items()
+                        if not q or now - q[-1] > 60]
+                for k in dead:
+                    _rate_buckets.pop(k, None)
+        except Exception as e:
+            print(f"[maintenance] {e}")
 
 
 def load_index():
     global index, metadata, bm25, retriever, categories, INDEX_MD5
     import faiss
     import hashlib
+    # P0 配置 fail-fast：embedding/gen 为每个查询必需，缺失即启动报错（避免运行期晦涩失败）；
+    # rerank 至少需一个 Key，否则仅告警不阻断（可在查询中关 use_rerank，缺失时检索期已有明确报错）
+    require_keys("EMBEDDING_API_KEY", "GEN_API_KEY")
+    if not (RERANK_API_KEY or DASHSCOPE_API_KEY):
+        print("[配置告警] 未配置 RERANK_API_KEY/DASHSCOPE_API_KEY，rerank 不可用；"
+              "如需使用请在查询中关闭 use_rerank，否则检索期将明确报错。")
     index = faiss.read_index(ascii_faiss_path(INDEX_FILE))
     h = hashlib.md5()
     with open(INDEX_FILE, "rb") as f:
@@ -168,13 +207,23 @@ def load_index():
                                 use_bm25=True, use_rerank=True,
                                 rerank_topn=RERANK_TOPN)
     stat = {}
+    text_n = img_n = 0
     for m in metadata:
+        if m.get("is_shadow"):
+            continue  # 双向量影子槽与主条目同图，不占类目统计
         cat = m.get("category", "未分类")
         c = stat.setdefault(cat, {"text_count": 0, "image_count": 0})
-        c["text_count" if m["type"] == "text" else "image_count"] += 1
+        if m["type"] == "text":
+            c["text_count"] += 1
+            text_n += 1
+        else:
+            c["image_count"] += 1
+            img_n += 1
     categories = [{"name": k, **v} for k, v in
                   sorted(stat.items(), key=lambda x: -sum(x[1].values()))]
-    print(f"[启动] 索引 {index.ntotal} 条, {len(categories)} 类别, 生成模型={GEN_MODEL}")
+    print(f"[启动] 索引 {index.ntotal} 槽 / {len(metadata)} 块"
+          f"（文本 {text_n} + 图片 {img_n}，图片双向量每张占 2 槽）, "
+          f"{len(categories)} 类别, 生成模型={GEN_MODEL}")
 
 
 # AGICTO 业务错误信封（HTTP 200 + {"error": {...}}）的稳定 code → 中文提示。
@@ -278,6 +327,15 @@ def retrieve(query, top_k=5, category=None, use_rerank=True, use_rewrite=False,
                                 confidence_min=INTENT_CONFIDENCE_MIN)
         trace["intent_types"] = intent["query_types"]
         trace["intent_confidence"] = intent["confidence"]
+        if intent.get("elapsed_ms") is not None:
+            trace["intent_ms"] = intent["elapsed_ms"]
+        # 降级可见化：告诉前端这次是否退化成"原 query 直接检索"以及为什么，
+        # 前端在工作人员面板如实标注，不再让用户以为改写生效了。
+        if intent.get("degraded"):
+            trace["intent_degraded"] = True
+            trace["intent_degrade_reason"] = intent.get("degrade_reason", "unknown")
+        if intent.get("rule_gate"):
+            trace["rule_gate"] = intent["rule_gate"]
 
     # 追问短路：不超上限才追问，超了按原 query 强行检索作答
     if intent["action"] == "clarify" and sess_clarify_get(session_id) < INTENT_MAX_CLARIFY:
@@ -336,19 +394,42 @@ def retrieve(query, top_k=5, category=None, use_rerank=True, use_rewrite=False,
                                         bm25_weight=eff_bm_weight,
                                         on_stage=on_stage)
         trace["sub_queries"] = sub_queries
+        trace["evidence_check"] = {"triggered": False, "skipped": "multi_intent"}
     else:
-        ranked = retriever.search(vecs[0], sub_queries[0], k=top_k,
-                                  use_rerank=use_rerank, rerank_query=rerank_q,
-                                  allowed_idxs=allowed_idxs,
-                                  max_per_source=MAX_PER_SOURCE,
-                                  use_mmr=USE_MMR, mmr_lambda=mmr_lam,
-                                  bm25_weight=eff_bm_weight,
-                                  on_stage=on_stage)
+        # S3：单意图分支接证据充分性自检（多意图分支本轮不接，trace 标记 skipped，
+        # 避免每个子问题各触发一次自检把延迟与成本放大 N 倍）
+        ranked, ev_info = retriever.search_with_evidence_check(
+            vecs[0], sub_queries[0], k=top_k,
+            use_rerank=use_rerank, rerank_query=rerank_q,
+            allowed_idxs=allowed_idxs,
+            max_per_source=MAX_PER_SOURCE,
+            use_mmr=USE_MMR, mmr_lambda=mmr_lam,
+            bm25_weight=eff_bm_weight,
+            on_stage=on_stage,
+            self_check=EVIDENCE_SELF_CHECK, max_retry=EVIDENCE_MAX_RETRY)
+        if ev_info["triggered"]:
+            trace["evidence_check"] = {k2: v for k2, v in ev_info.items()
+                                       if k2 != "missing"}
+            trace["evidence_check"]["missing"] = ev_info["missing"][:60]
+        else:
+            trace["evidence_check"] = {"triggered": False}
     trace["retrieve_ms"] = int((time.time() - t_rec) * 1000)
 
-    # 媒体匹配：用主意图向量全库扫描图片（仅 470 条，开销可忽略）
+    # 媒体匹配：用主意图向量全库扫描图片（双向量下按 group 归并——影子槽不重复占位、
+    # 且映射回主条目，避免 pick_image 看到同一张图两个候选或 content="" 的影子卡；
+    # 与 retriever._dedup_vec_ranks 同口径：同组取最高分）
     media_scores, media_idxs = index.search(np.array([vecs[0]], dtype="float32"), index.ntotal)
-    media_ranked = [(int(i), float(s)) for i, s in zip(media_idxs[0], media_scores[0]) if i != -1]
+    _media_best = {}
+    for i, s in zip(media_idxs[0], media_scores[0]):
+        if i == -1:
+            continue
+        m = metadata[int(i)]
+        prim = m["shadow_of"] if m.get("is_shadow") else int(i)
+        g = m.get("group_key") or m.get("chunk_hash") or prim
+        s = float(s)
+        if g not in _media_best or s > _media_best[g][1]:
+            _media_best[g] = (prim, s)
+    media_ranked = sorted(_media_best.values(), key=lambda x: x[1], reverse=True)
     trace["total_ms"] = int((time.time() - t0) * 1000)
     return "retrieve", "", ranked, media_ranked, effective_query, trace
 
@@ -436,8 +517,12 @@ app = Flask(__name__, template_folder="templates", static_folder="static")
 
 
 def rate_limited():
-    """简单滑动窗口限流：每 IP 每分钟 RATE_LIMIT_PER_MIN 次（查询类接口）。"""
-    ip = request.headers.get("X-Forwarded-For", request.remote_addr or "?")
+    """简单滑动窗口限流：每 IP 每分钟 RATE_LIMIT_PER_MIN 次（查询类接口）。
+
+    键取 remote_addr：本服务绑 127.0.0.1，X-Forwarded-For 完全由客户端可控，
+    信任它等于把限流开关交给请求方（伪造轮换头即可绕过）；仅当 remote_addr
+    缺失（非常规代理场景）才回退 XFF。"""
+    ip = request.remote_addr or request.headers.get("X-Forwarded-For", "?")
     now = time.time()
     with _rate_lock:
         q = _rate_buckets.setdefault(ip, deque())
@@ -461,18 +546,22 @@ def serve_kb_image(rel_path):
 
 @app.route("/api/categories")
 def api_categories():
-    return jsonify({"categories": categories, "total": index.ntotal,
+    # total=块数（双向量后槽位数多于块数，统计口径以块为准，影子槽不单列）
+    return jsonify({"categories": categories, "total": len(metadata),
                     "model": GEN_MODEL})
 
 
 @app.route("/api/stats")
 def api_stats():
-    """口径统一：总数动态计算，前端不再写死。"""
+    """口径统一：总数动态计算，前端不再写死。双向量索引按块计数（影子槽不计）。"""
     text_n = sum(1 for m in metadata if m["type"] == "text")
+    image_n = sum(1 for m in metadata
+                  if m["type"] == "image" and not m.get("is_shadow"))
     return jsonify({
-        "total": index.ntotal,
+        "total": len(metadata),
         "text": text_n,
-        "image": index.ntotal - text_n,
+        "image": image_n,
+        "index_slots": index.ntotal,  # 双向量：每张图片占 2 槽，槽位数 >= 块数
         "categories": len(categories),
         "gen_model": GEN_MODEL,
         "embedding_model": EMBEDDING_MODEL,
@@ -525,6 +614,18 @@ def api_health():
         "embed_cache": len(_emb_cache),
         "embed_cache_hit_rate": round(emb_hit_rate, 4) if emb_hit_rate is not None else None,
         "rerank_cumulative": dict(RERANK_STATS),
+        "intent_cumulative": {
+            "step1_ok": INTENT_STATS["step1_ok"],
+            "step1_degraded": INTENT_STATS["step1_degraded"],
+            "step2_degraded": INTENT_STATS["step2_degraded"],
+            "low_confidence": INTENT_STATS["low_confidence"],
+            "rule_gate_hit": INTENT_STATS["rule_gate_hit"],
+            "pronoun_gate_hit": INTENT_STATS.get("pronoun_gate_hit", 0),
+            "llm_retried": INTENT_STATS["llm_retried"],
+            "llm_calls_failed": INTENT_STATS["llm_calls_failed"],
+            "json_salvaged": INTENT_STATS.get("json_salvaged", 0),
+            "degraded_by": dict(INTENT_STATS["degraded_by"]),
+        },
         "uptime_sec": int(time.time() - START_TS),
     })
 
@@ -740,4 +841,5 @@ def new_session():
 
 if __name__ == "__main__":
     load_index()
+    threading.Thread(target=_maintenance_loop, daemon=True).start()
     app.run(host="127.0.0.1", port=5001, debug=False, threaded=True)

@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>迪士尼 RAG 助手 · 完整知识库版</title>
 <script src="/static/marked.min.js"></script>
+<script src="/static/purify.min.js"></script>
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
 
@@ -484,6 +485,41 @@
   .conv-assistant .bubble table { border-collapse: collapse; width: 100%; margin: 10px 0; }
   .conv-assistant .bubble th,.conv-assistant .bubble td { border: 1px solid rgba(255,255,255,0.15); padding: 6px 10px; text-align: left; }
   .conv-assistant .bubble th { background: rgba(108,92,231,0.3); color: var(--disney-gold); }
+  /* 追问气泡：与正常答案视觉区分，明确“机器人主动要求补充信息” */
+  .conv-assistant.clarify-bubble .bubble {
+    background: rgba(255,177,66,0.10); border: 1px solid rgba(255,177,66,0.55);
+    border-left: 4px solid #ffb142;
+  }
+  .clarify-badge {
+    display: inline-flex; align-items: center; gap: 6px; margin-bottom: 8px;
+    padding: 3px 10px; border-radius: 999px; font-size: 12px; font-weight: 600;
+    color: #ffb142; background: rgba(255,177,66,0.16); border: 1px solid rgba(255,177,66,0.45);
+  }
+  /* 工作人员面板：信息不足·已主动追问 提示态 */
+  .rag-clarify-note {
+    display: none; margin: 10px 0 2px; padding: 8px 12px; border-radius: 10px;
+    font-size: 12.5px; line-height: 1.6; color: #ffb142;
+    background: rgba(255,177,66,0.12); border: 1px solid rgba(255,177,66,0.4);
+  }
+  .rag-steps.is-clarify .rag-step { color: rgba(255,255,255,0.3); }
+  .rag-steps.is-clarify .rag-step .step-dot { border-color: rgba(255,255,255,0.25); }
+  /* 追问气泡内的“补充信息后重试”按钮 */
+  .clarify-retry-btn {
+    display: inline-flex; align-items: center; gap: 6px; margin-top: 12px;
+    padding: 7px 14px; border: none; border-radius: 10px; cursor: pointer;
+    font-size: 13px; font-weight: 600; color: #1b1030;
+    background: linear-gradient(135deg, #ffb142, #ff9f43);
+    box-shadow: 0 2px 8px rgba(255,159,67,0.35); transition: filter .15s ease;
+  }
+  .clarify-retry-btn:hover { filter: brightness(1.08); }
+  .clarify-retry-btn:active { transform: translateY(1px); }
+  /* 更强版：幽灵描边样式，与原问题+补充拼接后直接重发 */
+  .clarify-retry-btn.ghost {
+    color: #ffb142; background: transparent; border: 1px solid rgba(255,177,66,0.55);
+    box-shadow: none;
+  }
+  .clarify-retry-btn.ghost:hover { background: rgba(255,177,66,0.12); filter: none; }
+  .clarify-btns { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 12px; }
   .stream-cursor::after { content: '▋'; animation: blink 0.8s infinite; color: var(--disney-gold); }
   @keyframes blink { 50% { opacity: 0; } }
   .tag-row { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 8px; }
@@ -560,6 +596,8 @@
           <div class="rag-step" data-step="retrieve"><span class="step-dot"></span><span class="step-text">Top-K 混合检索中（向量 + BM25）</span></div>
           <div class="rag-step" data-step="rerank"><span class="step-dot"></span><span class="step-text">Rerank 重排中（rerank-v3.5）</span></div>
           <div class="rag-step" data-step="generate"><span class="step-dot"></span><span class="step-text">LLM 答案生成中</span></div>
+          <!-- 信息不足·已主动追问 提示态：检索/生成均未触发 -->
+          <div class="rag-clarify-note" id="ragClarifyNote">🤔 信息不足，已主动追问：本轮未触发检索与 LLM 生成，请用户补充信息后重试。</div>
         </div>
       </div>
 
@@ -650,6 +688,12 @@
     const div = document.createElement('div');
     div.textContent = str == null ? '' : str;
     return div.innerHTML;
+  }
+  function sanitizeHtml(html) {
+    // 安全闸：LLM 答案/知识库内容经 marked 转 HTML 后统一净化，剥离 <script>、on* 事件、javascript: 等
+    // 优先 DOMPurify；静态资源缺失时退化为纯文本转义（丢格式但不丢安全）
+    if (window.DOMPurify) return DOMPurify.sanitize(html == null ? '' : html);
+    return escapeHtml(html);
   }
   function imgUrl(relPath) {
     if (!relPath) return '';
@@ -835,6 +879,11 @@
 
   function resetRagSteps() {
     ragStatus = { skips: {}, current: null, notes: {} };
+    // 追问态清理：恢复 RAG 阶段默认呈现，隐藏“信息不足”提示
+    const note = document.getElementById('ragClarifyNote');
+    if (note) note.style.display = 'none';
+    const stepsBox = document.getElementById('ragSteps');
+    if (stepsBox) stepsBox.classList.remove('is-clarify');
     // 如实标记“已跳过”，不伪造进度：改写关闭/后端未启用意图功能、重排关闭
     if (!document.getElementById('tRewrite').checked || !intentEnabled) {
       ragStatus.skips.rewrite = true;
@@ -845,6 +894,47 @@
     // embed 每次必需、不可跳过；预置第一个未跳过阶段，后端 stage 事件到达后接管
     ragStatus.current = RAG_ORDER.find(s => !ragStatus.skips[s]);
     renderRag();
+  }
+  // 后端判定信息缺失、主动追问：RAG 阶段整体灰显，并展示“信息不足·已主动追问”提示
+  function showClarifyRagState() {
+    ragStatus = { skips: {}, current: null, notes: {} };
+    const stepsBox = document.getElementById('ragSteps');
+    if (stepsBox) stepsBox.classList.add('is-clarify');
+    const note = document.getElementById('ragClarifyNote');
+    if (note) note.style.display = 'block';
+  }
+  // 追问气泡徽标：明确“机器人主动要求补充信息”而非给出答案
+  function clarifyBadgeHtml() {
+    return '<div class="clarify-badge">🤔 信息不足 · 需要您补充后再答</div>';
+  }
+  // 追问气泡内的“补充信息后重试”按钮：预填原问题并聚焦输入框，便于用户追加补充
+  function clarifyRetryBtnHtml() {
+    return '<button type="button" class="clarify-retry-btn" onclick="retryClarify()">↻ 补充信息后重试</button>';
+  }
+  // 更强版按钮：原问题 + 用户输入的补充说明 拼接后直接重发
+  function clarifyAutoBtnHtml() {
+    return '<button type="button" class="clarify-retry-btn ghost" onclick="retryClarifyAuto()">⚡ 补充并直接重发</button>';
+  }
+  // 两个重试按钮并排容器
+  function clarifyBtnsHtml() {
+    return '<div class="clarify-btns">' + clarifyRetryBtnHtml() + clarifyAutoBtnHtml() + '</div>';
+  }
+  function retryClarify() {
+    const inp = document.getElementById('queryInput');
+    // 预填被追问的原始问题，光标置于末尾，等待用户追加缺失信息
+    inp.value = (lastQuery || '') + (lastQuery ? ' ' : '');
+    inp.focus();
+    try { inp.setSelectionRange(inp.value.length, inp.value.length); } catch (e) {}
+    inp.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  }
+  // 更强版：把“原问题 + 用户输入的补充说明”拼接后直接重发（等价于在输入框补全后点查询）
+  function retryClarifyAuto() {
+    const inp = document.getElementById('queryInput');
+    const extra = inp.value.trim();
+    const combined = (lastQuery ? lastQuery + (extra ? ' ' + extra : '') : extra);
+    if (!combined) return;
+    inp.value = combined;
+    doSearch();
   }
   // 加载面板按身份呈现：游客魔法话术 / 工作人员真实阶段
   function showLoadingPanel() {
@@ -898,6 +988,7 @@
 
   // ---------- 智能问答 ----------
   let sessionId = null;
+  let lastQuery = '';   // 最近一次提交的查询，供“补充信息后重试”预填
 
   // 空对话占位：有任何消息（含报错气泡）时隐藏“暂无对话记录”
   function updateEmptyHint() {
@@ -918,6 +1009,7 @@
   async function doSearch() {
     const query = document.getElementById('queryInput').value.trim();
     if (!query) return;
+    lastQuery = query;   // 记录原始查询，供追问后“补充信息重试”预填
     if (!sessionId) await newSession();
 
     const topK = parseInt(document.getElementById('topKSlider').value);
@@ -963,6 +1055,7 @@
         const reader = resp.body.getReader();
         const dec = new TextDecoder();
         let buf = '', fullText = '', metaChunks = [], metaMatched = null, streamErr = '';
+        let isClarify = false;
         while (true) {
           const { done, value } = await reader.read();
           if (done) break;
@@ -980,8 +1073,14 @@
                 metaChunks = obj.chunks;
                 metaMatched = obj.matched_image || null;
                 renderChunks(metaChunks, category, metaMatched);
-                // 检索与重排已结束，工作人员面板推进到 LLM 生成阶段
-                finishRagRetrieval();
+                if (obj.clarify) {
+                  // 信息缺失·主动追问：不进入检索/生成，面板切换为“信息不足”提示态
+                  isClarify = true;
+                  showClarifyRagState();
+                } else {
+                  // 检索与重排已结束，工作人员面板推进到 LLM 生成阶段
+                  finishRagRetrieval();
+                }
               }
               else if (obj.type === 'stage') {
                 // 后端真实阶段：rewrite / embed / retrieve / rerank / generate，
@@ -1001,7 +1100,13 @@
           }
         }
         if (streamErr) throw new Error(streamErr);
-        bubble.innerHTML = renderAnswerHtml(fullText);
+        if (isClarify) {
+          // 追问气泡：加徽标 + 区分样式 + 两个重试按钮，明确“机器人要求补充信息”
+          asstDiv.classList.add('clarify-bubble');
+          bubble.innerHTML = clarifyBadgeHtml() + renderAnswerHtml(fullText) + clarifyBtnsHtml();
+        } else {
+          bubble.innerHTML = renderAnswerHtml(fullText);
+        }
         if (metaChunks.length) renderChunks(metaChunks, category, metaMatched);
       } catch (e) {
         bubble.innerHTML = '<span style="color:#ff7675">❌ ' + escapeHtml(e.message) + '</span>';
@@ -1022,9 +1127,14 @@
         });
         const data = await resp.json();
         if (!resp.ok) throw new Error(data.error || '请求失败');
+        // 信息缺失·主动追问：加徽标 + 区分样式 + 重试按钮，明确“机器人要求补充信息”
+        const clarifyCls = data.clarify ? ' clarify-bubble' : '';
+        const clarifyBadge = data.clarify ? clarifyBadgeHtml() : '';
+        const clarifyBtn = data.clarify ? clarifyBtnsHtml() : '';
         convArea.insertAdjacentHTML('beforeend',
-          `<div class="conv-msg conv-assistant"><div class="bubble">${renderAnswerHtml(data.answer || '')}</div></div>`);
+          `<div class="conv-msg conv-assistant${clarifyCls}"><div class="bubble">${clarifyBadge}${renderAnswerHtml(data.answer || '')}${clarifyBtn}</div></div>`);
         renderChunks(data.chunks, data.category, data.matched_image);
+        if (data.clarify) showClarifyRagState();
         document.getElementById('queryInput').value = '';
       } catch (e) {
         convArea.insertAdjacentHTML('beforeend',
@@ -1143,7 +1253,7 @@
         wrap.appendChild(t);
       }
     });
-    return box.innerHTML;
+    return sanitizeHtml(box.innerHTML);
   }
   // 从文本中提取所有 Markdown 表格块，渲染为可展开/横滚的卡片预览
   function renderTablePreview(text) {
@@ -1286,7 +1396,7 @@
         ? `<img src="${imgUrl(c.rel_path)}" data-rp="${escapeHtml(c.rel_path)}"
              onclick="lbOpenAt('${scope}', this.dataset.rp)" onerror="imgBroken(this)">`
         : '';
-      contentEl.innerHTML = imgHtml + (c.content ? marked.parse(c.content) : '');
+      contentEl.innerHTML = imgHtml + (c.content ? sanitizeHtml(marked.parse(c.content)) : '');
     } else {
       // 文本 chunk：用 marked 渲染，表格/列表/代码均可正确呈现；表格横滚、表头吸顶、斑马纹
       contentEl.innerHTML = enhanceTablesHtml(marked.parse(c.content || ''));

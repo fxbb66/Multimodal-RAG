@@ -177,16 +177,28 @@ def collect_images():
 
 
 def embed_image(path, text=None):
-    """多模态 embedding：直接用图片视觉向量（1152 维）。
-    OCR+caption 文本保留在 metadata.content 供 BM25 命中，向量侧走跨模态视觉向量，
-    文字查询（如"邮轮价格"）也能通过语义空间匹配到图片。"""
+    """图片双向量 embedding（tongyi-embedding-vision-plus，文本/图片同空间 1152 维）：
+    - visual：图片视觉向量（跨模态语义匹配，"是不是价格表"类 generic 查询）
+    - text  ：OCR+caption 文本向量（细粒度表格语义查询，如"三人间比双人间贵多少"）
+    两张向量入同一 FAISS 索引不同行，检索时按 group_key 去重取最高分（见 retriever）。
+    此前仅入视觉向量，OCR 文本只进 BM25，故细粒度表格查询召回不足（image_recall 0.731）。"""
     with open(path, "rb") as f:
         b64 = base64.b64encode(f.read()).decode("utf-8")
     ext = os.path.splitext(path)[1].lower().lstrip(".")
     if ext == "jpg":
         ext = "jpeg"
-    return call_with_retry([{"image": f"data:image/{ext};base64,{b64}"}],
-                           label=f"图片 {os.path.basename(path)}")[0]
+    data_url = f"data:image/{ext};base64,{b64}"
+    visual = call_with_retry([{"image": data_url}],
+                             label=f"图片视觉 {os.path.basename(path)}")[0]
+    text_vec = visual  # 默认回退视觉向量（无 OCR/caption 时）
+    if text:
+        try:
+            text_vec = call_with_retry([{"text": text}],
+                                      label=f"图片文本 {os.path.basename(path)}")[0]
+        except Exception as e:
+            print(f"    [图片文本向量失败，回退视觉向量] {os.path.basename(path)} {str(e)[:80]}")
+            text_vec = visual
+    return visual, text_vec
 
 
 def main():
@@ -203,7 +215,7 @@ def main():
 
     text_vectors = embed_texts(chunks)
 
-    print("\n处理图片 ...")
+    print("\n处理图片（双向量：视觉 + 文本）...")
     # M1: 加载 OCR + caption 文本
     img_texts = {}
     # N2: 优先模型指纹文件，回退无指纹旧版（迁移期兼容）
@@ -213,24 +225,41 @@ def main():
         img_texts = {k: v for k, v in raw.items() if k != "__cache_meta__"}
         print(f"图片文本缓存: {os.path.basename(img_texts_path)} ({len(img_texts)} 张)")
     images = collect_images()
-    image_meta, image_vectors = [], []
+    image_pairs = []  # 每个图片: (real_meta, shadow_meta, visual_vec, text_vec)
     for rel, fp in images:
         print(f"  - {rel}")
         info = img_texts.get(rel, {})
         ocr = info.get("ocr", "")
         cap = info.get("caption", "")
         text_content = f"{cap}\n{ocr}".strip() if (ocr or cap) else f"[图片] {os.path.basename(rel)}"
-        image_vectors.append(embed_image(fp, text=text_content))
-        image_meta.append({
+        visual, text_vec = embed_image(fp, text=text_content)
+        H = image_chunk_hash(rel)
+        real_meta = {
             "type": "image",
-            "chunk_hash": image_chunk_hash(rel),
+            "chunk_hash": H,                 # 主条目：承载 OCR/caption 文本与 BM25
+            "group_key": H,                 # 与 shadow 同组，检索去重归并
+            "is_shadow": False,
             "source": f"图片: {os.path.basename(rel)}",
-            "content": text_content,     # M1: OCR+caption 文本，可被 BM25/向量检索
+            "content": text_content,         # M1: OCR+caption 文本，可被 BM25/向量检索
             "path": fp,
             "rel_path": rel,
             "category": rel.split(os.sep)[0],
             "tags": extract_tags(os.path.basename(rel), rel.split(os.sep)[0], cap),
-        })
+        }
+        shadow_meta = {
+            "type": "image",
+            "chunk_hash": H + ":vt",         # 唯一后缀，避免破坏构建报告 chunk_hash 唯一性检查
+            "group_key": H,                 # 与 real 同组，检索去重归并
+            "is_shadow": True,
+            "shadow_of": -1,                # 下方展平后回填主条目索引
+            "source": f"图片: {os.path.basename(rel)}",
+            "content": "",                  # 空内容：不进 BM25、不参与 R4 有效性判定（由 real 承载）
+            "path": fp,
+            "rel_path": rel,
+            "category": rel.split(os.sep)[0],
+            "tags": [],
+        }
+        image_pairs.append((real_meta, shadow_meta, visual, text_vec))
 
     # 组装 metadata（与向量顺序严格对齐）
     metadata = []
@@ -248,12 +277,18 @@ def main():
             "tags": c.get("tags", []),                                # M2
             "sources": c["sources"],
         })
-    for i, m in enumerate(image_meta):
-        m["id"] = len(metadata)
-        metadata.append(m)
+    # 图片双向量：每个图片展平为 [real, shadow] 两条，与 FAISS 行严格对齐
+    image_vectors_all = []
+    for real_meta, shadow_meta, visual, text_vec in image_pairs:
+        real_idx = len(metadata)
+        shadow_meta["shadow_of"] = real_idx
+        metadata.append(real_meta)
+        metadata.append(shadow_meta)
+        image_vectors_all.append(visual)
+        image_vectors_all.append(text_vec)
 
     # R6: 向量 L2 归一化，使用 IndexFlatIP（内积 = 余弦相似度）
-    all_vectors = np.array(text_vectors + image_vectors, dtype="float32")
+    all_vectors = np.array(text_vectors + image_vectors_all, dtype="float32")
     dim = all_vectors.shape[1]
     # N6: 维度与 settings.EMBEDDING_DIM 强校验，防止换模型后混库
     if dim != EMBEDDING_DIM:
@@ -263,7 +298,7 @@ def main():
     norms = np.linalg.norm(all_vectors, axis=1, keepdims=True)
     norms[norms == 0] = 1.0
     all_vectors = all_vectors / norms
-    print(f"\n向量维度: {dim}, 总向量数: {len(all_vectors)} (文本 {len(text_vectors)} + 图片 {len(image_vectors)})")
+    print(f"\n向量维度: {dim}, 总向量数: {len(all_vectors)} (文本 {len(text_vectors)} + 图片向量 {len(image_vectors_all)}=每张2向量)")
 
     import faiss
     index = faiss.IndexFlatIP(dim)  # R6: 归一化后内积=余弦相似度
@@ -298,7 +333,9 @@ def write_stage2_report(index, metadata, chunks, images, dim, bm25_path):
     独立于构建过程：重建后由 main 调用；对历史已建好的索引可离线补生成，
     检查逻辑唯一来源（禁止另写一套口径）。"""
     n_text = sum(1 for m in metadata if m["type"] == "text")
-    n_image = sum(1 for m in metadata if m["type"] == "image")
+    # 图片双向量：每张图片=real+shadow 两条；n_image 只数真实图片（非影子）
+    n_image = sum(1 for m in metadata if m["type"] == "image" and not m.get("is_shadow"))
+    n_shadow = sum(1 for m in metadata if m.get("is_shadow"))
     hashes_all = [m.get("chunk_hash") for m in metadata]
     stage1_md5 = None
     if os.path.exists(BUILD_REPORT_FILE):
@@ -310,7 +347,7 @@ def write_stage2_report(index, metadata, chunks, images, dim, bm25_path):
     checks = {
         "dim_match_settings": dim == EMBEDDING_DIM,
         "index_count_eq_metadata": index.ntotal == len(metadata),
-        "total_eq_text_plus_image": len(metadata) == n_text + n_image,
+        "total_eq_text_plus_image": len(metadata) == n_text + n_image + n_shadow,
         "text_count_eq_chunks": n_text == len(chunks),
         "image_count_eq_discovered": n_image == len(images),
         "chunk_hash_full_coverage": all(hashes_all),

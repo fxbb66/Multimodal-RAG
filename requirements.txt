@@ -1,6 +1,6 @@
-# 迪士尼 RAG 助手（7-完整知识库版本）运行依赖
-# Python 3.11/3.12（Windows 建议 3.11）
-# 安装：python -m venv .venv && .venv\Scripts\pip install -r 7-完整知识库版本\requirements.txt
+# 迪士尼 RAG 助手（8-金标扩充版本）运行依赖
+# Python 3.11/3.12（Windows 建议 3.11；实测 3.13 亦可运行）
+# 安装：python -m venv .venv && .venv\Scripts\pip install -r 8-金标扩充版本\requirements.txt
 
 # --- Web 服务 ---
 Flask==3.1.3

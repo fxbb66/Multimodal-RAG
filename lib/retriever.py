@@ -13,15 +13,31 @@
   R5  专有名词词典：查询改写与同义词扩展
   I1  父子 chunk：子块召回、父块回填上下文
   M2  标签：从文件名/章节自动抽取
+  S7  融合前路径级 top-k 并集：RRF top-N 后把各路 top-k 并集的未入池候选附尾，
+      修复单路强命中被双路中位挤出候选池（settings.FUSION_PATH_UNION_TOPK）
+  S8  图片双向量：real+shadow 双槽 + group 归并去重（2-build_index.py 写入，
+      _dedup_vec_ranks 消费；shadow_of/group_key 字段随 metadata 走）
 """
 import os
 import re
 import math
 import json
 import time
+import random
 import threading
 import numpy as np
 from collections import Counter, OrderedDict
+
+# 意图链路 LLM 调用异常类型（延迟导入，避免无 openai 环境时 import 失败）
+try:
+    from openai import (APITimeoutError, APIConnectionError, RateLimitError,
+                        InternalServerError)
+except Exception:  # pragma: no cover - 仅在缺依赖的裸环境生效
+    class _DummyErr(Exception):
+        pass
+
+    APITimeoutError = APIConnectionError = RateLimitError = _DummyErr
+    InternalServerError = _DummyErr
 
 # ---------------------------------------------------------------- R5 专有名词词典
 DISNEY_DICT = {
@@ -128,7 +144,11 @@ import sys as _sys
 _sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from settings import (AGICTO_BASE_URL, RERANK_API_KEY, REWRITE_API_KEY,  # noqa: E402
                       REWRITE_MODEL, RERANK_MODELS, RERANK_DASHSCOPE_MODELS,
-                      BM25_WEIGHT)
+                      BM25_WEIGHT, INTENT_TIMEOUT, INTENT_MAX_RETRY,
+                      INTENT_BACKOFF_BASE, INTENT_TOTAL_BUDGET,
+                      EVIDENCE_SELF_CHECK, EVIDENCE_MAX_RETRY, EVIDENCE_CHECK_TIMEOUT,
+                      RERANK_MAX_RETRY, RERANK_BACKOFF_BASE,
+                      FUSION_PATH_UNION_TOPK)
 
 RERANK_STATS = {"calls": 0, "fallbacks": 0, "last_model": None, "last_source": None,
                 "circuit_skips": 0}  # P0-2: 核验 rerank 是否真正生效
@@ -139,6 +159,14 @@ _CIRCUIT = {}          # (source, model) -> 失败时刻 epoch
 _CIRCUIT_TTL = 600.0   # 冷却 10 分钟后放行一次探测（充值后无需重启进程）
 # 候选池流水诊断：search() 各阶段候选数累加（配合 queries 求均值），用于定位后处理损失发生在哪一段
 POOL_STATS = {"queries": 0, "rrf_out": 0, "after_r4": 0, "rerank_out": 0, "mmr_in": 0, "final": 0}
+# 意图链路降级归因（2026-10-20）：静默降级必须可观测，否则只能事后从指标塌陷反推。
+# degraded_total 按原因分桶，llm_retried 记录重试救回的次数——这两个数能直接回答
+# "重试是否真的有效"和"还剩多少题在裸奔原 query"。
+INTENT_STATS = {"step1_ok": 0, "step1_degraded": 0, "step2_degraded": 0,
+                "low_confidence": 0, "rule_gate_hit": 0, "pronoun_gate_hit": 0,
+                "degraded_by": Counter(), "llm_retried": 0,
+                "llm_calls_failed": 0, "last_error": ""}
+_INTENT_CLI = None
 
 
 def ascii_faiss_path(src_path):
@@ -221,7 +249,7 @@ def qwen_rerank(query, candidates, topk=5, info=None):
             with _STATS_LOCK:
                 RERANK_STATS["circuit_skips"] += 1
             continue  # 熔断中：本进程已知该级确定性失败，跳过不发请求
-        for attempt in range(2):
+        for attempt in range(RERANK_MAX_RETRY):
             try:
                 # 协议按平台自动适配（差异在平台而非模型名）：
                 #   AGICTO → Cohere 风格 REST /v1/rerank（rerank-v3.5、qwen3-rerank 同格式）
@@ -253,14 +281,22 @@ def qwen_rerank(query, candidates, topk=5, info=None):
             except Exception as e:
                 last_err = f"{model}@{source}: {e}"
                 # 401/403/404、余额不足与上游计费信封均为确定性失败：熔断本级并立即降级，
-                # 不重试（欠费状态下重试只会在每个查询上白等约 3s 退避 + 多发一次请求）
+                # 不重试（欠费状态下重试只会在每个查询上白等约 3s 退避 + 多发一次请求）。
+                # "overdue-payment"/"good standing" 为百炼欠费信封标记（HTTP 400 但语义确定）。
                 if any(code in str(e) for code in
                        ("401", "403", "404", "insufficient_quota",
-                        "Not enough available money", "payment method")):
+                        "Not enough available money", "payment method",
+                        "overdue-payment", "good standing")):
                     with _STATS_LOCK:
                         _CIRCUIT[key] = time.time()
                     break  # 确定性失败，换下一级
-            time.sleep(2 ** attempt)
+                # 瞬时失败（5xx/超时/连接错误）：full-jitter 指数退避重试本级。
+                # 风暴期 503 常持续数秒，2 次重试不够（实测整链失败率约 10%，
+                # 检索静默退化为未重排序）。full jitter（sleep∈[0, base·2^attempt]）
+                # 而非固定退避：评估 8 路并发下固定退避会同步重试、再同步撞上同一个
+                # burst（实测每档稳定 5-7 次扛不过），抖动后才能错峰穿过。
+                if attempt < RERANK_MAX_RETRY - 1:
+                    time.sleep(random.uniform(0, RERANK_BACKOFF_BASE * (2 ** attempt)))
         print(f"[rerank] {last_err}，尝试降级下一级")
     raise RuntimeError(f"rerank failed: {last_err}")
 
@@ -397,6 +433,8 @@ _STEP2_PROMPTS = {
 
 # 类型执行优先级（从高到低）：信息不足已由 Step1 直接短路，不进入此链
 _TYPE_PRIORITY = ["multi_intent", "rhetorical", "context_dependent", "pronoun", "comparison"]
+# S4 兜底用指代词表：长词优先匹配（"这个"先于"它"），命中即认为本句指代无法自消解
+_PRONOUN_HINTS = ("这个", "那个", "那里", "这些", "那些", "它们", "其它", "它")
 
 
 def _format_history(history):
@@ -410,14 +448,79 @@ def _format_history(history):
     return "\n".join(lines)
 
 
+def _intent_cli():
+    """意图链路专用 OpenAI 客户端单例。
+
+    为什么必须单例：openai 客户端内部持 httpx 连接池，线程安全可共享。
+    旧实现每次调用新建客户端，意图链路一次问答最多 6 次调用（Step1 + 各 Step2），
+    等于每问重建 6 条 TCP+TLS 连接——这是 2026-10-20 实测中
+    "Request timed out" 集中爆发的首要原因（135 条金标实测 18 条需改写题
+    因超时静默降级为原 query 检索，占需改写题的 18%）。
+    """
+    global _INTENT_CLI
+    if _INTENT_CLI is None:
+        from openai import OpenAI
+        _INTENT_CLI = OpenAI(api_key=REWRITE_API_KEY, base_url=AGICTO_BASE_URL,
+                             timeout=INTENT_TIMEOUT, max_retries=0)
+    return _INTENT_CLI
+
+
 def _intent_llm(prompt, max_tokens=400, model=None):
-    """统一走 AGICTO OpenAI 兼容接口；失败抛异常由调用方降级。"""
-    from openai import OpenAI
-    cli = OpenAI(api_key=REWRITE_API_KEY, base_url=AGICTO_BASE_URL)
-    resp = cli.chat.completions.create(
-        model=model or REWRITE_MODEL, max_tokens=max_tokens,
-        messages=[{"role": "user", "content": prompt}])
-    return resp.choices[0].message.content.strip()
+    """统一走 AGICTO OpenAI 兼容接口。
+
+    加固要点（2026-10-20）：
+      1. 客户端单例，复用连接池（见 _intent_cli 注释）；
+      2. 显式 timeout（INTENT_TIMEOUT，默认 45s），不再依赖 SDK 默认的 10 分钟——
+         长挂起会把 8 并发评估线程全部拖死，表现为大面积静默降级；
+      3. 有限重试 + 指数退避 + 抖动（INTENT_MAX_RETRY，默认 2 次），
+         只对可重试错误（超时/连接错误/5xx/429）重试；
+      4. 失败抛异常由调用方降级，降级原因计入 INTENT_STATS 便于归因。
+    """
+    cli = _intent_cli()
+    last_err = None
+    for attempt in range(INTENT_MAX_RETRY + 1):
+        try:
+            if attempt:
+                with _STATS_LOCK:
+                    INTENT_STATS["llm_retried"] += 1
+            resp = cli.chat.completions.create(
+                model=model or REWRITE_MODEL, max_tokens=max_tokens,
+                messages=[{"role": "user", "content": prompt}])
+            text = (resp.choices[0].message.content or "").strip()
+            if not text:
+                raise RuntimeError("意图链路返回空内容")
+            return text
+        except Exception as e:
+            last_err = e
+            if not _intent_retryable(e) or attempt >= INTENT_MAX_RETRY:
+                break
+            # 指数退避 + 抖动：多线程同时失败时错开重试，避免同步撞上游
+            wait = INTENT_BACKOFF_BASE * (2 ** attempt) + random.uniform(0, INTENT_BACKOFF_BASE)
+            time.sleep(wait)
+    with _STATS_LOCK:
+        INTENT_STATS["llm_calls_failed"] += 1
+        INTENT_STATS["last_error"] = str(last_err)[:120]
+    raise last_err
+
+
+def _intent_retryable(e):
+    """异常分类：可重试（超时/连接/限流/5xx）vs 终止（参数错/内容审核/4xx）。
+
+    内容审核类拒绝（DataInspectionFailed）重试无意义——重发同样内容必然再次被拒，
+    必须立即终止并降级，否则白白多花一个 RTT 的等待。
+    """
+    s = str(e).lower()
+    if "datainspection" in s or "inappropriate content" in s:
+        return False
+    if "insufficient_quota" in s or "invalid_api_key" in s:
+        return False
+    if isinstance(e, (APITimeoutError, APIConnectionError, RateLimitError,
+                      InternalServerError, APITimeoutError)):
+        return True
+    if any(k in s for k in ("timeout", "timed out", "connection", "temporarily",
+                            "too many requests", "rate limit", "502", "503", "504")):
+        return True
+    return False
 
 
 def _extract_json(text):
@@ -461,13 +564,21 @@ def _normalize_type(t):
 
 
 def analyze_intent(query, history=None, model=None):
-    """Step 1 意图识别。返回规范化 dict；失败返回 None（调用方应降级为原 query）。"""
+    """Step 1 意图识别。返回规范化 dict；失败返回 None（调用方应降级为原 query）。
+
+    容错加固（2026-10-20）：模型偶发把 JSON 包在解释文字里或截断，
+    原实现只认严格的 { } / [ ] 配对，解析失败即整条降级。
+    现在补三道兜底：截断补全、单引号转双引号、就近抓取 types 数组。
+    宁可给出一个低质量类型，也不要让整条意图链路裸奔。
+    """
     # 模板内含 JSON 示例花括号，用 replace 而非 .format 注入
     prompt = (_INTENT_STEP1_PROMPT
               .replace("{history}", _format_history(history))
               .replace("{query}", query))
     raw = _intent_llm(prompt, max_tokens=400, model=model)
     data = _extract_json(raw)
+    if not isinstance(data, dict):
+        data = _salvage_intent_json(raw)
     if not isinstance(data, dict):
         return None
     types = data.get("query_types") or []
@@ -488,6 +599,108 @@ def analyze_intent(query, history=None, model=None):
     }
 
 
+# ---------------------------------------------------------------- S3 证据充分性自检（2026-10-20）
+# 检索后追问一句"这些片段够不够回答问题"：不够就用词典扩展 query 再检一次。
+# 设计约束：
+#   1. 自检本身是一次 LLM 调用，失败时判 sufficient=True（不重检索、不阻塞回答），
+#      与意图链路同思路——自检是"锦上添花"，不能变成新的故障点；
+#   2. 判定标准写进 prompt：片段能直接回答或提供关键事实 -> true；
+#      仅边缘相关且关键参数缺失 -> false（触发重检索）；
+#   3. 重检索用 expand_query_terms 的扩展 query（同义词词典，不引入新 LLM 调用），
+#      结果替换首轮（不是拼接——拼接时新块永远排在第 k 位之后，等于没补）。
+_EVIDENCE_CHECK_PROMPT = """你是检索质量评估专家，服务于上海迪士尼度假区问答系统。
+给定用户问题与检索到的知识库片段，判断这些片段是否包含回答问题所需的关键信息。
+
+判定标准（严格）：
+- 片段能直接回答问题，或包含回答所需的关键事实/参数 -> sufficient=true
+- 片段与问题仅边缘相关、主题不符，或关键参数（价格/时间/规则主体）缺失 -> sufficient=false
+- 片段是同一主题的背景介绍但缺问题所问的具体点 -> sufficient=false
+
+只输出 JSON，不要任何解释：{"sufficient": true/false, "missing": "缺失的关键信息（无则空字符串）"}
+
+【用户问题】
+{query}
+
+【检索片段】
+{context}
+"""
+
+
+def evidence_self_check(query, contents, model=None):
+    """S3 自检：top-k 片段是否足以回答 query。
+
+    contents: 按相关序的片段正文列表（top-k）。
+    返回 {"sufficient": bool, "missing": str, "degraded": bool}。
+    degraded=True 表示自检 LLM 调用失败——按"充分"处理（保守，不引入额外检索风险），
+    原因计入 INTENT_STATS.evidence_check_failed，在 /api/health 可见。
+    """
+    ctx = "\n\n".join(f"[{n+1}] {c[:400]}" for n, c in enumerate(contents)) or "（无片段）"
+    prompt = _EVIDENCE_CHECK_PROMPT.replace("{query}", query).replace("{context}", ctx)
+    try:
+        cli = _intent_cli()
+        resp = cli.chat.completions.create(
+            model=model or REWRITE_MODEL, max_tokens=150,
+            messages=[{"role": "user", "content": prompt}],
+            timeout=EVIDENCE_CHECK_TIMEOUT,  # per-request 覆盖：自检要快，不继承 45s
+        )
+        text = (resp.choices[0].message.content or "").strip()
+        data = _extract_json(text) or _salvage_intent_json(text) or {}
+        sufficient = bool(data.get("sufficient", True))
+        missing = str(data.get("missing", "") or "")[:80]
+        return {"sufficient": sufficient, "missing": missing, "degraded": False}
+    except Exception as e:
+        with _STATS_LOCK:
+            INTENT_STATS.setdefault("evidence_check_failed", 0)
+            INTENT_STATS["evidence_check_failed"] += 1
+        print(f"[evidence 自检降级] {str(e)[:80]}")
+        return {"sufficient": True, "missing": "", "degraded": True}
+
+
+def _salvage_intent_json(text):
+    """从非严格 JSON 的模型输出里抢救意图字段。
+
+    触发场景（均为实测踩过的形态）：
+      1. 输出被 max_tokens 截断，尾部引号/括号缺失；
+      2. 模型用单引号或中文引号；
+      3. JSON 前后夹带解释文字，且内部含嵌套 {} 导致配对失败。
+    策略：逐项独立正则捞字段，捞到多少算多少；types 至少能给出枚举即可用。
+    """
+    if not text:
+        return None
+    t = text.replace("'", '"').replace("“", '"').replace("”", '"')
+    out = {}
+    m = re.search(r'"query_types"\s*:\s*\[([^\]]*)\]', t)
+    if m:
+        out["query_types"] = re.findall(r'"([^"]+)"', m.group(1)) or \
+            [x.strip().strip('"') for x in m.group(1).split(",") if x.strip()]
+    m = re.search(r'"need_clarification"\s*:\s*(true|false)', t, re.I)
+    if m:
+        out["need_clarification"] = m.group(1).lower() == "true"
+    m = re.search(r'"clarification_question"\s*:\s*"([^"]*)"', t)
+    if m:
+        out["clarification_question"] = m.group(1)
+    m = re.search(r'"rewritten_query"\s*:\s*"([^"]*)"', t)
+    if m:
+        out["rewritten_query"] = m.group(1)
+    else:
+        m = re.search(r'"rewritten_query"\s*:\s*\[([^\]]*)\]', t)
+        if m:
+            out["rewritten_query"] = [x.strip().strip('"')
+                                      for x in m.group(1).split(",") if x.strip()]
+    m = re.search(r'"confidence"\s*:\s*([0-9.]+)', t)
+    if m:
+        try:
+            out["confidence"] = float(m.group(1))
+        except ValueError:
+            pass
+    # 至少要捞到类型或追问标志，否则视为不可用
+    if not out.get("query_types") and "need_clarification" not in out:
+        return None
+    with _STATS_LOCK:
+        INTENT_STATS["json_salvaged"] = INTENT_STATS.get("json_salvaged", 0) + 1
+    return out
+
+
 def _apply_step2(query, qtype, history, model=None, max_sub=4):
     """对单条 query 套用某类型的二级改写 prompt，返回改写文本（失败返回原文）。"""
     tpl = _STEP2_PROMPTS.get(qtype)
@@ -504,6 +717,9 @@ def _apply_step2(query, qtype, history, model=None, max_sub=4):
         return out.strip() or query
     except Exception as e:
         print(f"[intent step2 {qtype} 降级] {e}")
+        with _STATS_LOCK:
+            INTENT_STATS["step2_degraded"] += 1
+            INTENT_STATS["degraded_by"][f"step2_{qtype}"] += 1
         return query
 
 
@@ -586,23 +802,119 @@ def intent_rewrite(query, history=None, model=None, max_sub_queries=4,
     fallback = {"action": "retrieve", "clarify": "", "queries": [query],
                 "query_types": [], "multi_intent": False, "effective": query,
                 "confidence": 1.0}
+    # 预算起点在 Step1 完成后重置——Step1 是必需的（不做就无从判断意图），
+    # 预算真正约束的是"锦上添花"的 Step2 改写阶段。
+    # 2026-10-20 实测：Step1 单次约 10-15s，Step2 串联 1-2 次即再叠加同量级；
+    # 预算卡太紧会把改写整段跳掉（term_keep 掉到 0.839），卡太松则单问可到 30s。
+    # 20s 允许完成 1-2 次 Step2 调用，超出即停止后续改写、按已有结果继续检索。
+
+    # 预算起点用可变容器承载：Step1 完成后会重置为当前时刻，
+    # 使预算只约束"锦上添花"的 Step2 改写阶段（Step1 无论如何都要跑完）。
+    _budget = {"t0": time.time()}
+
+    def _budget_left():
+        """意图链路 Step2 阶段剩余时间预算。预算耗尽即停止后续 LLM 调用。"""
+        return INTENT_TOTAL_BUDGET - (time.time() - _budget["t0"])
+
+    def _degrade(reason, note=""):
+        """统一降级出口：记账 + 附原因，保证降级在 trace 里可见而非静默。"""
+        with _STATS_LOCK:
+            INTENT_STATS["degraded_by"][reason] += 1
+        out = dict(fallback)
+        out["degraded"] = True
+        out["degrade_reason"] = reason
+        if note:
+            out["degrade_note"] = note
+        return out
+
     # 规则门 1：无历史的极短无实体问（"多少钱/几点开始/在哪买"），LLM 此前一律误判直接检索。
     # 有历史时不触发——"那儿童票呢"这类承接性追问需走 LLM 指代消解（金标已验证）。
     gated = _rule_gate_short_no_entity(query, history)
     if gated is not None:
         print("[intent 规则门] 短问无实体 -> clarify")
+        with _STATS_LOCK:
+            INTENT_STATS["rule_gate_hit"] += 1
         return gated
+
+    # 规则门 2（前置）：≥3 个并列问句先做确定性切分，不依赖 LLM。
+    # 2026-10-20 变更——原实现把这条门放在 Step1 之后，一旦 Step1 超时降级就直接
+    # return fallback，三连问门根本没机会执行。实测"门票多少？酒店多少？停车多少？
+    # 演出几点？"这类题在超时轮次全部漏判。现在提前到 LLM 之前，纯字符串切分零成本零延迟，
+    # 且 LLM 成功时仍会覆盖（LLM 拆得更细时以其为准）。
+    segs = _rule_split_multi_question(query, min_segments=3)
+    if segs:
+        print(f"[intent 规则门] 三连问 -> 确定性拆分 {len(segs)} 段")
+        with _STATS_LOCK:
+            INTENT_STATS["rule_gate_hit"] += 1
+        out = {"action": "retrieve", "clarify": "", "queries": segs[:max_sub_queries],
+               "query_types": ["multi_intent"], "multi_intent": True,
+               "effective": " | ".join(segs[:max_sub_queries]),
+               "confidence": 1.0, "rule_gate": "multi_question_ge3"}
+        # 仍尝试用 LLM 细化每个子问题（消解指代/补全），失败不影响已完成的拆分
+        try:
+            intent = analyze_intent(query, history=history, model=model)
+            if intent and intent.get("confidence", 0) >= confidence_min:
+                out_qs = []
+                for sq in segs[:max_sub_queries]:
+                    cur = str(sq).strip()
+                    for t in _TYPE_PRIORITY:
+                        if t == "multi_intent" or t not in intent["query_types"]:
+                            continue
+                        if _budget_left() <= 0:  # 预算耗尽：保留已拆好的原句，不再逐类型改写
+                            print(f"[intent 预算] 剩余 {_budget_left():.1f}s，跳过 {t} 改写")
+                            cur = str(sq).strip()
+                            break
+                        cur = _apply_step2(cur, t, history, model, max_sub_queries)
+                        if isinstance(cur, list):
+                            cur = " ".join(str(x) for x in cur)
+                    if cur:
+                        out_qs.append(cur)
+                if out_qs:
+                    out["queries"] = out_qs
+                    out["effective"] = " | ".join(out_qs)
+                    out["query_types"] = sorted(set(out["query_types"]) | set(intent["query_types"]))
+                    out["confidence"] = intent["confidence"]
+                _budget["t0"] = time.time()  # Step1 完成，预算重置
+                with _STATS_LOCK:
+                    INTENT_STATS["step1_ok"] += 1
+            else:
+                with _STATS_LOCK:
+                    INTENT_STATS["low_confidence"] += 1
+        except Exception as e:
+            # 拆分已完成，LLM 只是锦上添花——记为可恢复降级，不算失败
+            with _STATS_LOCK:
+                INTENT_STATS["step1_degraded"] += 1
+                INTENT_STATS["degraded_by"]["step1_llm(拆分已完成)"] += 1
+            out["degraded"] = True
+            out["degrade_reason"] = "step1_llm(拆分已完成)"
+            print(f"[intent 三连问] Step1 细化降级（拆分已生效）: {str(e)[:60]}")
+        return out
+
     try:
         intent = analyze_intent(query, history=history, model=model)
     except Exception as e:
         print(f"[intent step1 降级] {e}")
-        return fallback
-    if not intent or intent["confidence"] < confidence_min:
-        print(f"[intent] 置信度不足或识别失败，按原 query 检索")
-        return fallback
+        with _STATS_LOCK:
+            INTENT_STATS["step1_degraded"] += 1
+        # 熔断：连续超时说明上游已不可用，连问号门都救不了，直接降级并记账
+        return _degrade("step1_exception", str(e)[:80])
+    if not intent:
+        with _STATS_LOCK:
+            INTENT_STATS["step1_degraded"] += 1
+        return _degrade("step1_parse_failed")
+    if intent["confidence"] < confidence_min:
+        print(f"[intent] 置信度不足({intent['confidence']:.2f}<{confidence_min})，按原 query 检索")
+        with _STATS_LOCK:
+            INTENT_STATS["low_confidence"] += 1
+        return _degrade("low_confidence", f"conf={intent['confidence']:.2f}")
 
+    with _STATS_LOCK:
+        INTENT_STATS["step1_ok"] += 1
+    # Step1 已完成，预算从此刻起算（只约束 Step2 改写阶段）
+    _budget["t0"] = time.time()
     types = list(intent["query_types"])
-    # 规则门 2：≥3 个并列问句而 LLM 未判多意图（三连问漏判兜底），按问号确定性切分
+    # 规则门 2（旧位置保留为二次校验）：Step1 已判多意图则无需再切；
+    # 未判且问号数 <3 时此处也不会命中，属幂等兜底。
     rule_multi = False
     if "multi_intent" not in types:
         segs = _rule_split_multi_question(query, min_segments=3)
@@ -612,6 +924,29 @@ def intent_rewrite(query, history=None, model=None, max_sub_queries=4,
             intent["rewritten_query"] = segs  # 直接喂多意图路径，跳过 LLM 再拆
             rule_multi = True
     hit = [t for t in _TYPE_PRIORITY if t in types]
+    # S4（2026-10-20）：无历史指代兜底——实测出现过两种自相矛盾模式：
+    #   模式A（135 金标复测观测）：need_clarification=false 却标了 underspecified；
+    #   模式B（183 全量重跑观测，"这个项目适合我吗？"）：need_clarification=true
+    #     （LLM 判定正确）但被下方"可改写类型存在时改写优先"覆盖回 retrieve，
+    #     而无历史时指代词根本没法消解，改写产出原句进检索 = 答非所问。
+    # 两种模式的共同充分条件：underspecified + 无会话历史 + 含指代词——
+    # 无历史时指代不可消解，追问是唯一正确行为，故不再看 need_clarification。
+    # 金标集中"指代词+无历史"仅 1 条（"这个项目适合我吗？"，标注 clarify），
+    # 放宽后零误伤；"门票多少钱？"类无指代词句不触发本门。
+    if ("underspecified" in types and not history):
+        pro = next((p for p in _PRONOUN_HINTS if p in query), "")
+        if pro:
+            print(f"[intent 规则门] 无历史指代({pro})+ underspecified -> clarify")
+            with _STATS_LOCK:
+                INTENT_STATS["rule_gate_hit"] += 1
+                INTENT_STATS.setdefault("pronoun_gate_hit", 0)
+                INTENT_STATS["pronoun_gate_hit"] += 1
+            return {"action": "clarify",
+                    "clarify": f"为了准确帮到您，请补充一下『{pro}』具体指什么"
+                               f"（哪个项目/酒店/票种）？",
+                    "queries": [query], "query_types": types, "multi_intent": False,
+                    "effective": query, "confidence": intent["confidence"],
+                    "rule_gate": "pronoun_no_history"}
     # 信息不足型：仅当查询无可改写类型（无指代/上下文依赖/多意图等）时才追问。
     # 若同时命中可改写类型，先走改写链——指代消解后通常就不再信息不足，
     # 强行追问反而会打断指代链（如"你刚提到的人物在哪见"被误追问）。
@@ -636,6 +971,9 @@ def intent_rewrite(query, history=None, model=None, max_sub_queries=4,
         for sq in subs[:max_sub_queries]:
             cur = str(sq).strip()
             for t in rest:
+                if _budget_left() <= 0:  # 预算耗尽：已拆好的子句照常检索，只是没做深度改写
+                    print(f"[intent 预算] 剩余 {_budget_left():.1f}s，跳过 {t} 改写")
+                    break
                 cur = _apply_step2(cur, t, history, model, max_sub_queries)
                 if isinstance(cur, list):  # 链中不应再出数组，防御性拍平
                     cur = " ".join(str(x) for x in cur)
@@ -650,13 +988,17 @@ def intent_rewrite(query, history=None, model=None, max_sub_queries=4,
     # 单意图（可多类型串联）
     cur = query
     for t in hit:
+        if _budget_left() <= 0:  # 预算耗尽：用上一步结果继续检索，不阻塞回答
+            print(f"[intent 预算] 剩余 {_budget_left():.1f}s，跳过 {t} 改写")
+            break
         cur = _apply_step2(cur, t, history, model, max_sub_queries)
         if isinstance(cur, list):
             cur = " ".join(str(x) for x in cur)
     cur = (cur or query).strip()
     return {"action": "retrieve", "clarify": "", "queries": [cur],
             "query_types": types, "multi_intent": False,
-            "effective": cur, "confidence": intent["confidence"]}
+            "effective": cur, "confidence": intent["confidence"],
+            "elapsed_ms": int((time.time() - _budget["t0"]) * 1000)}
 
 
 # ---------------------------------------------------------------- 综合检索器
@@ -664,13 +1006,17 @@ def intent_rewrite(query, history=None, model=None, max_sub_queries=4,
 class HybridRetriever:
     """向量 + BM25 混合检索，可选 rerank。"""
     def __init__(self, faiss_index, metadata, bm25=None,
-                 use_bm25=True, use_rerank=False, rerank_topn=10):
+                 use_bm25=True, use_rerank=False, rerank_topn=10,
+                 path_union_topk=FUSION_PATH_UNION_TOPK):
         self.index = faiss_index
         self.meta = metadata
         self.bm25 = bm25
         self.use_bm25 = use_bm25 and bm25 is not None
         self.use_rerank = use_rerank
         self.rerank_topn = rerank_topn
+        # S7：路径级 top-k 并集的每路截断深度（0=关闭，恢复纯 RRF top-N 行为）。
+        # 定标依据见 settings.FUSION_PATH_UNION_TOPK 注释（183 题本地预分析）。
+        self.path_union_topk = max(0, int(path_union_topk))
 
     def _vec_search(self, query_vec, k):
         v = np.array([query_vec], dtype="float32")
@@ -680,11 +1026,57 @@ class HybridRetriever:
 
     def _is_valid(self, m):
         """R4 前置过滤：跳过过短且非表格的无意义 chunk。"""
+        if m.get("is_shadow"):
+            return True   # 图片文本向量影子条目：由 real 主条目承载内容与有效性
         content = m.get("content", "")
         body = content.split("\n", 1)[-1] if "\n" in content else content
         if len(body) < 8 and "|" not in body:
             return False
         return True
+
+    def _dedup_vec_ranks(self, vec_ranks):
+        """图片双向量去重：同一 group_key（图片 visual + 文本影子）只保留向量分最高者，
+        并把影子条目映射回其主条目（shadow_of），避免同一图片在向量路占两席、
+        挤占文本 chunk 候选位。
+        有序性前提：FAISS 精确检索（IndexFlatIP）按分数降序返回，故同组最高分槽必先出现，
+        首次遭遇序即降序——换近似索引（IVF/HNSW 无全局有序保证）时此前提失效。"""
+        best = {}
+        for i, s in vec_ranks:
+            m = self.meta[i]
+            g = m.get("group_key") or m.get("chunk_hash")
+            prim = m["shadow_of"] if m.get("is_shadow") else i
+            cur = best.get(g)
+            if cur is None or s > cur[1]:
+                best[g] = (prim, s)
+        return [(i, s) for (i, s) in best.values()]
+
+    def _fuse_with_path_union(self, ranked_lists, weights, fuse_topk,
+                              apply_union=True):
+        """S7：加权 RRF 融合 + 路径级 top-k 并集保底（定标依据见 settings 注释）。
+        线上同款 RRF 取 top fuse_topk 后，把各路各自 top-path_union_topk 的并集中
+        未入池的候选按 RRF 分附在池尾——RRF 等权下单路 #0（0.5/61≈0.0082）竞争不过
+        双路 #10（2×0.5/71≈0.0141），强单路命中会被挤出 rerank 候选池
+        （S2 诊断 7/183；图片金标新索引 3 例 lost_at_fusion 同型）。
+        附尾候选在 rerank 失败降级时排后（低置信度的正确语义）；
+        仅 apply_union（调用方按 do_rerank 传入）时生效，无 rerank 档位行为不变。"""
+        fused = rrf_fuse(*ranked_lists, topk=fuse_topk, weights=weights)
+        if not (apply_union and self.path_union_topk > 0):
+            return fused
+        seen = {i for i, _ in fused}
+        extra = []
+        for rl in ranked_lists:
+            for i, _ in (rl[:self.path_union_topk] if rl else []):
+                if i not in seen:
+                    seen.add(i)
+                    extra.append(i)
+        if not extra:
+            return fused
+        # 全量 RRF 仅为取 extras 的融合分（降级路径排序用）；topk 取全量防截断丢分
+        total = sum(len(rl) for rl in ranked_lists)
+        full = rrf_fuse(*ranked_lists, topk=total, weights=weights)
+        score = dict(full)
+        extra.sort(key=lambda i: score.get(i, 0.0), reverse=True)
+        return fused + [(i, score.get(i, 0.0)) for i in extra]
 
     def search(self, query_vec, query_text, k=5,
                use_rerank=None, rerank_query=None,
@@ -705,6 +1097,7 @@ class HybridRetriever:
         # 向量路（类别约束下扩大召回池，保证过滤后仍能取满）
         vec_k = max(k * 6, 40) if allowed is not None else max(k * 4, 20)
         vec_ranks = self._vec_search(query_vec, vec_k)
+        vec_ranks = self._dedup_vec_ranks(vec_ranks)   # 图片双向量：同图 visual+文本 归并
         # 保留余弦相似度用于展示（RRF/rerank 分不直观）
         cos_map = {i: s for i, s in vec_ranks}
 
@@ -717,9 +1110,13 @@ class HybridRetriever:
             bm_ranks = self.bm25.search(exp_text, topk=vec_k)
             if allowed is not None:
                 bm_ranks = [(i, s) for i, s in bm_ranks if i in allowed]
-            fused = rrf_fuse(vec_ranks, bm_ranks,
-                              topk=self.rerank_topn if do_rerank else max(k * 3, 12),
-                              weights=[1.0 - bm_w, bm_w])
+            # S7：路径级 top-k 并集仅 do_rerank 时生效（候选池语义只对 rerank 有意义；
+            # 无 rerank 档位 topk=max(k*3,12) 后直接截 top-k，附尾候选永远够不着，
+            # 保持原行为便于档位归因）
+            fused = self._fuse_with_path_union(
+                [vec_ranks, bm_ranks], [1.0 - bm_w, bm_w],
+                self.rerank_topn if do_rerank else max(k * 3, 12),
+                apply_union=do_rerank)
         else:
             fused = [(i, s) for i, s in vec_ranks[:k]]
 
@@ -795,6 +1192,61 @@ class HybridRetriever:
             POOL_STATS["final"] += len(order[:k])
         return [(i, cos_map.get(i, 0.0)) for i in order[:k]]
 
+    def search_with_evidence_check(self, query_vec, query_text, k=5,
+                                   use_rerank=None, rerank_query=None,
+                                   allowed_idxs=None, max_per_source=None,
+                                   use_mmr=False, mmr_lambda=None,
+                                   bm25_weight=None, on_stage=None,
+                                   self_check=False, max_retry=1, model=None):
+        """S3：单意图检索 + 证据充分性自检 + 一次重检索闭环。
+
+        与 search() 同参数；self_check=True 时在首轮检索后追加：
+          1. evidence_self_check：LLM 判定 top-k 是否足以回答（失败按充分处理）；
+          2. 不充分 -> 用 expand_query_terms 扩展 query 重检索，结果替换首轮
+             （拼接无意义：新块永远排在第 k 位之后）；
+          3. max_retry 限制重检索次数（默认 1），防止"为补证据越查越偏"。
+        返回 (ranked, evidence_info)；evidence_info 供 trace/评估观测：
+          {"triggered", "sufficient", "missing", "retried", "degraded", "check_ms"}
+        """
+        ranked = self.search(query_vec, query_text, k=k, use_rerank=use_rerank,
+                             rerank_query=rerank_query, allowed_idxs=allowed_idxs,
+                             max_per_source=max_per_source, use_mmr=use_mmr,
+                             mmr_lambda=mmr_lambda, bm25_weight=bm25_weight,
+                             on_stage=on_stage)
+        info = {"triggered": False, "sufficient": None, "missing": "",
+                "retried": 0, "degraded": False, "check_ms": 0}
+        if not self_check or not ranked:
+            return ranked, info
+        t_chk = time.time()
+        contents = [self.meta[i].get("content", "") for i, _ in ranked]
+        chk = evidence_self_check(query_text, contents, model=model)
+        info["triggered"] = True
+        info["sufficient"] = chk["sufficient"]
+        info["missing"] = chk["missing"]
+        info["degraded"] = chk["degraded"]
+        info["check_ms"] = int((time.time() - t_chk) * 1000)
+        if chk["sufficient"]:
+            return ranked, info
+        # 不充分：词典扩展 query 重检索（不引入新 LLM 调用，成本=1 次 embedding+1 次检索）
+        for attempt in range(max_retry):
+            exp_q = expand_query_terms(query_text)
+            ranked2 = self.search(query_vec, exp_q, k=k, use_rerank=use_rerank,
+                                  rerank_query=exp_q, allowed_idxs=allowed_idxs,
+                                  max_per_source=max_per_source, use_mmr=use_mmr,
+                                  mmr_lambda=mmr_lambda, bm25_weight=bm25_weight,
+                                  on_stage=on_stage)
+            info["retried"] += 1
+            if ranked2:
+                ranked = ranked2  # 替换而非拼接，理由见 docstring
+            if ranked:
+                contents = [self.meta[i].get("content", "") for i, _ in ranked]
+                chk2 = evidence_self_check(exp_q, contents, model=model)
+                info["sufficient"] = chk2["sufficient"]
+                if chk2["sufficient"]:
+                    break
+        info["check_ms"] = int((time.time() - t_chk) * 1000)
+        return ranked, info
+
     def search_multi(self, query_vecs, query_texts, k=5,
                      use_rerank=None, rerank_query=None,
                      allowed_idxs=None, max_per_source=None, use_mmr=False,
@@ -813,6 +1265,7 @@ class HybridRetriever:
         ranked_lists, weights, cos_map, all_vec_ranks = [], [], {}, []
         for qv, qt in zip(query_vecs, query_texts):
             vec_ranks = self._vec_search(qv, vec_k)
+            vec_ranks = self._dedup_vec_ranks(vec_ranks)   # 图片双向量归并
             cos_map.update({i: s for i, s in vec_ranks})
             if allowed is not None:
                 vec_ranks = [(i, s) for i, s in vec_ranks if i in allowed]
@@ -827,9 +1280,12 @@ class HybridRetriever:
                 ranked_lists.append(bm_ranks)
                 weights.append(bm_w)
 
-        # 统一加权 RRF 融合所有子问题的所有路（k=60 与 rrf_fuse 保持一致）
-        fused = rrf_fuse(*ranked_lists, k=60, weights=weights,
-                          topk=(self.rerank_topn if do_rerank else max(k * 3, 12)))
+        # 统一加权 RRF 融合所有子问题的所有路（k=60 与 rrf_fuse 保持一致）；
+        # S7 路径级并集同样覆盖多意图（任一子问题的任一路强单路命中都保底进池）
+        fused = self._fuse_with_path_union(
+            ranked_lists, weights,
+            self.rerank_topn if do_rerank else max(k * 3, 12),
+            apply_union=do_rerank)
 
         # R4 过滤
         fused = [(i, s) for i, s in fused if self._is_valid(self.meta[i])]

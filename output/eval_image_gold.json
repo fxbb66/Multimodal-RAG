@@ -1,0 +1,245 @@
+{
+  "__meta__": {
+    "schema_ver": "image_gold_v1",
+    "ts": 1792514623,
+    "model": "qwen3.5-omni-flash",
+    "n_images": 9,
+    "note": "VL 模型基于图片+OCR 生成；gold 绑图片块 chunk_hash"
+  },
+  "items": [
+    {
+      "query": "12月15号双人房多少钱？",
+      "answer": "$1657.9",
+      "gold_chunk_hash": "bc7f89614ad9ab36b0e71cd3dfaa1b74b66084d0",
+      "source": "图片: 迪士尼邮轮价格1.jpeg",
+      "rel_path": "1-产品与服务详情\\迪士尼邮轮价格1.jpeg",
+      "gen": "vlm",
+      "model": "qwen3.5-omni-flash"
+    },
+    {
+      "query": "1月5号海景四人间总价？",
+      "answer": "$2204",
+      "gold_chunk_hash": "bc7f89614ad9ab36b0e71cd3dfaa1b74b66084d0",
+      "source": "图片: 迪士尼邮轮价格1.jpeg",
+      "rel_path": "1-产品与服务详情\\迪士尼邮轮价格1.jpeg",
+      "gen": "vlm",
+      "model": "qwen3.5-omni-flash"
+    },
+    {
+      "query": "三人间比双人间贵多少？",
+      "answer": "多$352",
+      "gold_chunk_hash": "bc7f89614ad9ab36b0e71cd3dfaa1b74b66084d0",
+      "source": "图片: 迪士尼邮轮价格1.jpeg",
+      "rel_path": "1-产品与服务详情\\迪士尼邮轮价格1.jpeg",
+      "gen": "vlm",
+      "model": "qwen3.5-omni-flash"
+    },
+    {
+      "query": "2026年1月19-22日标准内舱双人价多少？",
+      "answer": "第一第二人价432美元，第三第四人价282美元。",
+      "gold_chunk_hash": "c0c3f7a35518e9a74d0315538a868f99566db8b0",
+      "source": "图片: 迪士尼邮轮价格2.jpeg",
+      "rel_path": "1-产品与服务详情\\迪士尼邮轮价格2.jpeg",
+      "gen": "vlm",
+      "model": "qwen3.5-omni-flash"
+    },
+    {
+      "query": "礼宾套房四人间总价是多少？",
+      "answer": "总价是4676美元。",
+      "gold_chunk_hash": "c0c3f7a35518e9a74d0315538a868f99566db8b0",
+      "source": "图片: 迪士尼邮轮价格2.jpeg",
+      "rel_path": "1-产品与服务详情\\迪士尼邮轮价格2.jpeg",
+      "gen": "vlm",
+      "model": "qwen3.5-omni-flash"
+    },
+    {
+      "query": "1月26日到29日价格有变化吗？",
+      "answer": "有变化，标准内舱三人间二人价变为282美元。",
+      "gold_chunk_hash": "c0c3f7a35518e9a74d0315538a868f99566db8b0",
+      "source": "图片: 迪士尼邮轮价格2.jpeg",
+      "rel_path": "1-产品与服务详情\\迪士尼邮轮价格2.jpeg",
+      "gen": "vlm",
+      "model": "qwen3.5-omni-flash"
+    },
+    {
+      "query": "2月9号内舱双人间多少钱？",
+      "answer": "第一第二人价432美元，总价958美元",
+      "gold_chunk_hash": "6850337aab376cc458326b4fa35443766671ce43",
+      "source": "图片: 迪士尼邮轮价格3.jpeg",
+      "rel_path": "1-产品与服务详情\\迪士尼邮轮价格3.jpeg",
+      "gen": "vlm",
+      "model": "qwen3.5-omni-flash"
+    },
+    {
+      "query": "礼宾套房四人间最贵多少？",
+      "answer": "2月16号最贵，总价6914美元",
+      "gold_chunk_hash": "6850337aab376cc458326b4fa35443766671ce43",
+      "source": "图片: 迪士尼邮轮价格3.jpeg",
+      "rel_path": "1-产品与服务详情\\迪士尼邮轮价格3.jpeg",
+      "gen": "vlm",
+      "model": "qwen3.5-omni-flash"
+    },
+    {
+      "query": "三人间第三第四人价多少？",
+      "answer": "2月9号是282或336，2月16号是420或504",
+      "gold_chunk_hash": "6850337aab376cc458326b4fa35443766671ce43",
+      "source": "图片: 迪士尼邮轮价格3.jpeg",
+      "rel_path": "1-产品与服务详情\\迪士尼邮轮价格3.jpeg",
+      "gen": "vlm",
+      "model": "qwen3.5-omni-flash"
+    },
+    {
+      "query": "新加坡3晚内舱房多少钱？",
+      "answer": "第一第二人459美元，第三第四人297美元。",
+      "gold_chunk_hash": "f918be8ffad816dc5399c578d2033a88437c390f",
+      "source": "图片: 迪士尼邮轮价格4.jpeg",
+      "rel_path": "1-产品与服务详情\\迪士尼邮轮价格4.jpeg",
+      "gen": "vlm",
+      "model": "qwen3.5-omni-flash"
+    },
+    {
+      "query": "礼宾套房四人总价多少？",
+      "answer": "总价4952美元。",
+      "gold_chunk_hash": "f918be8ffad816dc5399c578d2033a88437c390f",
+      "source": "图片: 迪士尼邮轮价格4.jpeg",
+      "rel_path": "1-产品与服务详情\\迪士尼邮轮价格4.jpeg",
+      "gen": "vlm",
+      "model": "qwen3.5-omni-flash"
+    },
+    {
+      "query": "海景房和阳台房差价？",
+      "answer": "同房型海景比阳台便宜63美元。",
+      "gold_chunk_hash": "f918be8ffad816dc5399c578d2033a88437c390f",
+      "source": "图片: 迪士尼邮轮价格4.jpeg",
+      "rel_path": "1-产品与服务详情\\迪士尼邮轮价格4.jpeg",
+      "gen": "vlm",
+      "model": "qwen3.5-omni-flash"
+    },
+    {
+      "query": "12月18号内舱双人房多少钱？",
+      "answer": "12月18-22日标准内舱双人间总价$2174",
+      "gold_chunk_hash": "08e78d8463260e6a95d8ec395414402b692ac85f",
+      "source": "图片: 迪士尼邮轮价格5.jpeg",
+      "rel_path": "1-产品与服务详情\\迪士尼邮轮价格5.jpeg",
+      "gen": "vlm",
+      "model": "qwen3.5-omni-flash"
+    },
+    {
+      "query": "元旦期间海景三人间价格？",
+      "answer": "2026年1月1-5日标准海景三人间$3457",
+      "gold_chunk_hash": "08e78d8463260e6a95d8ec395414402b692ac85f",
+      "source": "图片: 迪士尼邮轮价格5.jpeg",
+      "rel_path": "1-产品与服务详情\\迪士尼邮轮价格5.jpeg",
+      "gen": "vlm",
+      "model": "qwen3.5-omni-flash"
+    },
+    {
+      "query": "1月8号内舱四人间每人价？",
+      "answer": "1月8-12日标准内舱四人间每人$612",
+      "gold_chunk_hash": "08e78d8463260e6a95d8ec395414402b692ac85f",
+      "source": "图片: 迪士尼邮轮价格5.jpeg",
+      "rel_path": "1-产品与服务详情\\迪士尼邮轮价格5.jpeg",
+      "gen": "vlm",
+      "model": "qwen3.5-omni-flash"
+    },
+    {
+      "query": "1月15号出发，标准内舱双人房多少钱？",
+      "answer": "第一第二人价612美元，总价1318美元。",
+      "gold_chunk_hash": "d49dd2a53ac6de329f695f8c5ba7d16ad7dcfc40",
+      "source": "图片: 迪士尼邮轮价格6.jpeg",
+      "rel_path": "1-产品与服务详情\\迪士尼邮轮价格6.jpeg",
+      "gen": "vlm",
+      "model": "qwen3.5-omni-flash"
+    },
+    {
+      "query": "新加坡4晚，哪种房型最贵？",
+      "answer": "礼宾套房四人间，总价6540美元。",
+      "gold_chunk_hash": "d49dd2a53ac6de329f695f8c5ba7d16ad7dcfc40",
+      "source": "图片: 迪士尼邮轮价格6.jpeg",
+      "rel_path": "1-产品与服务详情\\迪士尼邮轮价格6.jpeg",
+      "gen": "vlm",
+      "model": "qwen3.5-omni-flash"
+    },
+    {
+      "query": "1月29号出发，第三第四人海景房价格？",
+      "answer": "每人每晚476美元，总价2876美元。",
+      "gold_chunk_hash": "d49dd2a53ac6de329f695f8c5ba7d16ad7dcfc40",
+      "source": "图片: 迪士尼邮轮价格6.jpeg",
+      "rel_path": "1-产品与服务详情\\迪士尼邮轮价格6.jpeg",
+      "gen": "vlm",
+      "model": "qwen3.5-omni-flash"
+    },
+    {
+      "query": "2月5号标准内舱双人多少钱？",
+      "answer": "$1318",
+      "gold_chunk_hash": "f69fed6d2063ba4eee7667fee29473d83cdcd560",
+      "source": "图片: 迪士尼邮轮价格7.jpeg",
+      "rel_path": "1-产品与服务详情\\迪士尼邮轮价格7.jpeg",
+      "gen": "vlm",
+      "model": "qwen3.5-omni-flash"
+    },
+    {
+      "query": "2月19日海景房三人价？",
+      "answer": "$3457",
+      "gold_chunk_hash": "f69fed6d2063ba4eee7667fee29473d83cdcd560",
+      "source": "图片: 迪士尼邮轮价格7.jpeg",
+      "rel_path": "1-产品与服务详情\\迪士尼邮轮价格7.jpeg",
+      "gen": "vlm",
+      "model": "qwen3.5-omni-flash"
+    },
+    {
+      "query": "3月19号内舱双人房多少钱？",
+      "answer": "796美元",
+      "gold_chunk_hash": "4157558a4fea96a0fd97bf26707366b77c89dbab",
+      "source": "图片: 迪士尼邮轮价格8.jpeg",
+      "rel_path": "1-产品与服务详情\\迪士尼邮轮价格8.jpeg",
+      "gen": "vlm",
+      "model": "qwen3.5-omni-flash"
+    },
+    {
+      "query": "海景房比内舱贵多少？",
+      "answer": "贵332美元",
+      "gold_chunk_hash": "4157558a4fea96a0fd97bf26707366b77c89dbab",
+      "source": "图片: 迪士尼邮轮价格8.jpeg",
+      "rel_path": "1-产品与服务详情\\迪士尼邮轮价格8.jpeg",
+      "gen": "vlm",
+      "model": "qwen3.5-omni-flash"
+    },
+    {
+      "query": "4人间第三第四人价多少？",
+      "answer": "187.8美元",
+      "gold_chunk_hash": "4157558a4fea96a0fd97bf26707366b77c89dbab",
+      "source": "图片: 迪士尼邮轮价格8.jpeg",
+      "rel_path": "1-产品与服务详情\\迪士尼邮轮价格8.jpeg",
+      "gen": "vlm",
+      "model": "qwen3.5-omni-flash"
+    },
+    {
+      "query": "12月22号内舱双人房总价多少？",
+      "answer": "标准内舱双人间，第一第二人价$1300，总价$2694。",
+      "gold_chunk_hash": "6d9a5356c154cc024300ddbde743c22d3e0de191",
+      "source": "图片: 迪士尼邮轮价格9.jpeg",
+      "rel_path": "1-产品与服务详情\\迪士尼邮轮价格9.jpeg",
+      "gen": "vlm",
+      "model": "qwen3.5-omni-flash"
+    },
+    {
+      "query": "新加坡航次第三第四人价格差多少？",
+      "answer": "内舱三四人同价$845，海景阳台$1015或$1115。",
+      "gold_chunk_hash": "6d9a5356c154cc024300ddbde743c22d3e0de191",
+      "source": "图片: 迪士尼邮轮价格9.jpeg",
+      "rel_path": "1-产品与服务详情\\迪士尼邮轮价格9.jpeg",
+      "gen": "vlm",
+      "model": "qwen3.5-omni-flash"
+    },
+    {
+      "query": "12月27号礼宾套房三人间多少钱？",
+      "answer": "礼宾套房三人间，第一第二人价$4815，总价$11696。",
+      "gold_chunk_hash": "6d9a5356c154cc024300ddbde743c22d3e0de191",
+      "source": "图片: 迪士尼邮轮价格9.jpeg",
+      "rel_path": "1-产品与服务详情\\迪士尼邮轮价格9.jpeg",
+      "gen": "vlm",
+      "model": "qwen3.5-omni-flash"
+    }
+  ]
+}

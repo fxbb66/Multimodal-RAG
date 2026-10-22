@@ -1,14 +1,21 @@
 # 密钥
 .env
 
-# 构建产物
-output/
+# 构建产物（人工金标数据例外：评估输入，随仓库分发，其余 output/ 内容仍忽略）
+output/*
+!output/eval_qa_v2.json
+!output/eval_image_gold.json
 converted/
 
 # Python
 __pycache__/
 *.pyc
 .venv/
+.venv-eval/
 
 # 临时
 *.log
+
+# 备份与编辑器配置
+*.bak
+.obsidian/
